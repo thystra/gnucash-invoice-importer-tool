@@ -1,0 +1,34 @@
+{
+  "vendor": "lowes",
+  "source": "retail_account_preloaded_state",
+  "type": "sale|return",
+  "order_number": "string",
+  "purchase_date": "YYYY-MM-DD HH:MM:SS",
+  "status": "string",
+  "channel": "Online|In-Store",
+  "store_number": "string",
+  "subtotal": "decimal string",
+  "shipping": "decimal string",
+  "adjustments": "decimal string",
+  "tax": "decimal string",
+  "total": "decimal string",
+  "items": [
+    {
+      "sku": "string",
+      "description": "string",
+      "quantity": "decimal string",
+      "unit_price": "decimal string, may be >2 decimals",
+      "extended_amount": "pre-tax line amount",
+      "tax": "line tax",
+      "discount_total": "line discount amount"
+    }
+  ],
+  "payments": [
+    {
+      "method": "string",
+      "last4": "string",
+      "amount": "decimal string",
+      "transaction_type": "string"
+    }
+  ]
+}

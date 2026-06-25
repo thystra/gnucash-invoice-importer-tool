@@ -1,0 +1,86 @@
+# Python virtual environments
+.venv/
+venv/
+env/
+ENV/
+scraper_venv/
+*/.venv/
+*/venv/
+
+# Python cache/build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Playwright / browser cache
+.playwright/
+ms-playwright/
+
+# Local PHP/tool runtime files
+review.sqlite
+review.sqlite-*
+*.db
+*.sqlite
+*.sqlite3
+*.log
+logs/
+tmp/
+cache/
+runtime/
+
+# Local config/secrets
+.env
+.env.*
+config.local.php
+config/*.local.php
+secrets.json
+
+# GnuCash books and backups
+*.gnucash
+*.gnucash.*
+*.xac
+*.LCK
+
+# Generated imports/exports and scraper captures
+captures/
+scraped_pages/
+saved_pages/
+normalized/
+exports/
+imported/
+vendor_exports/
+
+# Vendor/year generated scrape folders
+tsc202*/
+lowes202*/
+amazon202*/
+costco202*/
+walmart202*/
+homedepot202*/
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Tractor Supply generated scrape/export artifacts
+tractorsupply_scraper/[0-9][0-9][0-9][0-9]-export/
+tractorsupply_scraper/[0-9][0-9][0-9][0-9]-normalized.zip
+tractorsupply_scraper/[0-9][0-9][0-9][0-9]-tsc.zip
+tractorsupply_scraper/**/raw_html/
+
+# General generated scraper artifacts
+**/raw_html/
+**/*-normalized.zip
+**/*-tsc.zip

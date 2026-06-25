@@ -1,0 +1,138 @@
+# GnuCash Vendor Import Tool v119
+
+Single-file PHP review/import tool with integrated Amazon invoice sanity checks, transaction matching, copied-book invoice repair, normal payment application, and a separate CREDIT/refund matching helper.
+
+## v119 changes
+
+- Step 5 command display now uses the most recent ready-payment plan filename exported from Step 4.
+  - The old placeholder `amazon-ready-payment-application-plan.csv` is no longer shown.
+  - Dry-run and apply commands are shown in bounded copyable text areas.
+- Step 5 payment application script can now match/reuse existing imported bank/gift-card transactions instead of creating duplicate payment transactions.
+  - New flags: `--match-existing`, `--no-create-missing`, and `--match-date-window-days`.
+  - With `--match-existing --no-create-missing`, the script looks for an existing transaction in the mapped payment account with the expected amount and nearby date.
+  - If it finds one exact safe candidate, it attaches or converts the existing offset split to the target bill's A/P lot.
+  - If no existing transaction is found, it reports an error instead of creating a duplicate.
+  - The old create-new behavior is still available by omitting those flags.
+- Wizard now includes a Step 6 CREDIT/refund matching page with a copyable `gnucash_credit_refund_match_v1.py` command.
+- Carries forward v118/v117 fixes: bounded command display, asset accounts in payment mapping suggestions, noon-safe payment dates, and CREDIT/refund helper.
+
+## v125 notes
+
+- Step 5 existing-payment matching can now reuse A/P prepayment splits already attached to a standalone prepayment lot. If the candidate transaction has the expected mapped-account split and an A/P split of the expected amount, and the old lot contains only that A/P split, the apply script will reassign that A/P split to the target bill lot instead of creating a duplicate payment.
+- One-sided date window behavior from v124 is retained: existing transaction date must be on or after the Amazon payment date and within the configured +N day window.
+
+## Install
+
+```bash
+cd /home/alan/public_html
+unzip /path/to/gnucash_vendor_import_tool_v119.zip
+
+cp gnucash_vendor_import_tool_v119/index.php gnu2/index.php
+cp gnucash_vendor_import_tool_v119/README.md gnu2/README.md
+cp gnucash_vendor_import_tool_v119/gnucash_invoice_repair_apply_v4.py gnu2/gnucash_invoice_repair_apply_v4.py
+cp gnucash_vendor_import_tool_v119/gnucash_invoice_open_date_repair.py gnu2/gnucash_invoice_open_date_repair.py
+cp gnucash_vendor_import_tool_v119/gnucash_payment_apply_v1.py gnu2/gnucash_payment_apply_v1.py
+cp gnucash_vendor_import_tool_v119/gnucash_credit_refund_match_v1.py gnu2/gnucash_credit_refund_match_v1.py
+
+chmod +x gnu2/gnucash_invoice_repair_apply_v4.py \
+  gnu2/gnucash_invoice_open_date_repair.py \
+  gnu2/gnucash_payment_apply_v1.py \
+  gnu2/gnucash_credit_refund_match_v1.py
+
+sudo systemctl reload php8.5-fpm
+sudo systemctl reload nginx
+```
+
+Use all apply scripts only against a copied/test GnuCash book while GnuCash is closed. Review generated dry-run CSVs before applying.
+
+## Step 5 normal payment application workflow
+
+Export the ready plan from Step 4 in the browser wizard, then go to Step 5. The wizard will display commands using that exact timestamped plan filename.
+
+Recommended dry-run mode for books that already have bank/gift-card transactions imported:
+
+```bash
+python3 /home/alan/public_html/gnu2/gnucash_payment_apply_v1.py \
+  --book /home/alan/public_html/gnu2/Johnson2026.apitest.gnucash \
+  --plan /home/alan/public_html/gnu2/exports/amazon-ready-payment-application-plan-YYYYMMDD-HHMMSS.csv \
+  --out /home/alan/public_html/gnu2/exports/amazon-payment-apply-dryrun-YYYYMMDD-HHMMSS-v119.csv \
+  --match-existing \
+  --no-create-missing \
+  --dry-run
+```
+
+Expected dry-run statuses:
+
+- `READY_MATCH_EXISTING_DRYRUN`: preferred; the script found exactly one existing imported transaction to attach.
+- `ERROR_NO_EXISTING_PAYMENT_MATCH`: no existing transaction was found. Either import/fix the bank/gift-card transaction, widen the date window carefully, or deliberately run without `--no-create-missing` to create a new payment.
+- `READY_CREATE_MISSING_DRYRUN`: only appears when `--match-existing` is used without `--no-create-missing`.
+
+Apply mode:
+
+```bash
+python3 /home/alan/public_html/gnu2/gnucash_payment_apply_v1.py \
+  --book /home/alan/public_html/gnu2/Johnson2026.apitest.gnucash \
+  --plan /home/alan/public_html/gnu2/exports/amazon-ready-payment-application-plan-YYYYMMDD-HHMMSS.csv \
+  --out /home/alan/public_html/gnu2/exports/amazon-payment-apply-results-YYYYMMDD-HHMMSS-v119.csv \
+  --match-existing \
+  --no-create-missing \
+  --apply
+```
+
+The script still refuses apply on non-test-looking book filenames unless `--allow-non-copy-name` is supplied.
+
+## Step 6 CREDIT/refund matching workflow
+
+Step 6 is for Amazon `*-CREDIT` vendor credit bills. It does not create refund activity. First enter/import the refund transaction from Amazon gift-card activity or credit-card activity into the correct GnuCash account, then run the matcher.
+
+Default refund/stored-value accounts scanned by Step 6:
+
+- `Assets:Other Current Assets:Amazon Gift Card (Returns)`
+- `Assets:Other Current Assets:Amazon Credit Card Cash Back`
+- `Liabilities:Credit Cards:Amazon Chase Card 2246`
+
+Dry run:
+
+```bash
+python3 /home/alan/public_html/gnu2/gnucash_credit_refund_match_v1.py \
+  --book /home/alan/public_html/gnu2/Johnson2026.apitest.gnucash \
+  --from-date '2025-01-01' \
+  --to-date '2026-12-31' \
+  --out /home/alan/public_html/gnu2/exports/amazon-credit-refund-match-dryrun-2025-v119.csv \
+  --dry-run
+```
+
+Apply only after the dry-run shows exact one-to-one matches.
+
+## Safety notes
+
+- Keep GnuCash closed while the scripts run.
+- Use `.apitest`, `.copy`, `.working`, or another test-looking filename first.
+- Step 5 normal purchase payments and Step 6 CREDIT/refunds are intentionally separate workflows.
+- For existing imported transaction matching, the script only accepts narrow candidates: matching mapped account, expected signed amount, nearby date, no attachment to another lot, and either an unattached A/P split or a simple two-split transaction whose offset split can be converted to A/P.
+
+The v119 zip contains source code/scripts only. It does not contain any GnuCash book file or Amazon CSV data.
+
+
+## v125
+- Fixed fatal error in transactions wizard caused by missing DEFAULT_GIFT_CARD_RETURNS_ACCOUNT_AMAZON constant.
+- Keeps v125 de-duplicated account suggestions and Step 5 existing-payment diagnostics.
+
+
+## v125 note
+
+This build corrects the package version constant so `index.php` reports `APP_VERSION = v125` instead of the stale v119 value. It retains the v121 missing `DEFAULT_GIFT_CARD_RETURNS_ACCOUNT_AMAZON` fix, the v120 account-suggestion de-duplication, and the v119/v120 Step 5 existing-payment matching workflow.
+
+
+## v125
+
+- Existing-payment matcher now searches both the mapped source account and the A/P side of existing imported transactions.
+- This catches manually imported/matched transactions that already transfer to Liabilities:Accounts Payable but were not attached to the bill lot.
+- Source-account sign differences are treated as diagnostics/scoring while the A/P split must still have the correct payment sign for the bill lot.
+- No-match dry runs now include nearby same-account split diagnostics where available.
+
+
+## v125 notes
+- Step 5 existing-payment matching now uses a one-sided date window: imported payment transaction date must be on or after the Amazon payment date and no more than N days later.
+- Wizard Step 5 commands include `--match-date-window-days 5`.
+- This avoids selecting earlier same-amount card transactions while still allowing bank/card posting delays.
