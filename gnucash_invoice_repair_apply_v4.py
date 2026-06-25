@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """
+# SPDX-FileCopyrightText: 2026 Alan Johnson
+# SPDX-License-Identifier: GPL-3.0-or-later
 GnuCash Amazon invoice repair apply script v4.
 
 Intended for copied test books only. It repairs two narrow automated repair cases:
