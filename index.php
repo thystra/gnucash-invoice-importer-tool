@@ -9,7 +9,7 @@
 
 declare(strict_types=1);
 
-const APP_VERSION = 'v204';
+const APP_VERSION = 'v206';
 const APP_DB = __DIR__ . '/data/review.sqlite';
 const DEFAULT_VENDOR_AMAZON = '000005';
 const DEFAULT_VENDOR_COSTCO = '000001';
@@ -41,33 +41,7 @@ const DEFAULT_AP_ACCOUNT = 'Liabilities:Accounts Payable';
 $donationUrl = getenv('GNUCASH_TOOL_DONATION_URL') ?: 'https://ko-fi.com/thewolfandtheraven';
 $showDonationBanner = getenv('GNUCASH_TOOL_SHOW_DONATION_BANNER') !== '0';
 
-function load_user_default_config_overrides(): array
-{
-    $path = __DIR__ . '/config/user_defaults.php';
-
-    if (!is_readable($path)) {
-        return [];
-    }
-
-    $data = require $path;
-
-    if (!is_array($data)) {
-        return [];
-    }
-
-    $out = [];
-    foreach ($data as $key => $value) {
-        $key = strtoupper(trim((string)$key));
-        if ($key === '') {
-            continue;
-        }
-        $out[$key] = is_scalar($value) || $value === null ? (string)$value : '';
-    }
-
-    return $out;
-}
-
-function default_variable_config_defaults(): array {
+function default_variable_config_builtin_defaults(): array {
     return [
         'DEFAULT_VENDOR_AMAZON' => DEFAULT_VENDOR_AMAZON,
         'DEFAULT_VENDOR_COSTCO' => DEFAULT_VENDOR_COSTCO,
@@ -92,9 +66,136 @@ function default_variable_config_defaults(): array {
         'DEFAULT_LOWES_PARTIAL_RETURN_MANUAL_STAGE_MIN_AMOUNT' => DEFAULT_LOWES_PARTIAL_RETURN_MANUAL_STAGE_MIN_AMOUNT,
         'DEFAULT_AP_ACCOUNT' => DEFAULT_AP_ACCOUNT,
     ];
-    $overrides = load_user_default_config_overrides();
-    return array_replace($defaults, array_intersect_key($overrides, $defaults));
 }
+
+function user_defaults_config_path(): string {
+    return __DIR__ . '/config/user_defaults.php';
+}
+
+function invalidate_user_defaults_config_cache(): void {
+    $path = user_defaults_config_path();
+
+    clearstatcache(true, $path);
+
+    if (function_exists('opcache_invalidate') && is_file($path)) {
+        @opcache_invalidate($path, true);
+    }
+}
+
+function load_user_default_config_overrides(): array {
+    $path = user_defaults_config_path();
+    invalidate_user_defaults_config_cache();
+
+    if (!is_readable($path)) {
+        return [];
+    }
+
+    $data = require $path;
+
+    if (!is_readable($path)) {
+        return [];
+    }
+
+    $data = require $path;
+
+    if (!is_array($data)) {
+        return [];
+    }
+
+    $allowed = array_fill_keys(array_keys(default_variable_config_builtin_defaults()), true);
+    $out = [];
+
+    foreach ($data as $key => $value) {
+        $key = strtoupper(trim((string)$key));
+
+        if ($key === '' || !isset($allowed[$key])) {
+            continue;
+        }
+
+        $out[$key] = is_scalar($value) || $value === null ? trim((string)$value) : '';
+    }
+
+    return $out;
+}
+
+function default_variable_config_defaults(): array {
+    return array_replace(
+        default_variable_config_builtin_defaults(),
+        load_user_default_config_overrides()
+    );
+}
+
+function write_user_default_config(array $values): void {
+    $path = user_defaults_config_path();
+    $dir = dirname($path);
+
+    if (!is_dir($dir) && !mkdir($dir, 0775, true) && !is_dir($dir)) {
+        throw new RuntimeException('Could not create config directory: ' . $dir);
+    }
+
+    if (file_exists($path) && !is_writable($path)) {
+        throw new RuntimeException('User defaults file is not writable by PHP: ' . $path);
+    }
+
+    if (!file_exists($path) && !is_writable($dir)) {
+        throw new RuntimeException('Config directory is not writable by PHP: ' . $dir);
+    }
+
+    $defaults = default_variable_config_builtin_defaults();
+    $current = array_replace($defaults, load_user_default_config_overrides());
+
+    foreach ($values as $key => $value) {
+        $key = strtoupper(trim((string)$key));
+
+        if (!array_key_exists($key, $defaults)) {
+            continue;
+        }
+
+        $current[$key] = is_scalar($value) || $value === null ? trim((string)$value) : '';
+    }
+
+    $body = "<?php\n"
+        . "/*\n"
+        . " * Local default vendor/account configuration.\n"
+        . " * This file is generated/updated by the Config page.\n"
+        . " * It is intentionally ignored by Git and should survive hard resets.\n"
+        . " */\n\n"
+        . "return " . var_export($current, true) . ";\n";
+
+    $tmp = $path . '.tmp.' . getmypid();
+
+    if (file_put_contents($tmp, $body, LOCK_EX) === false) {
+        throw new RuntimeException('Could not write temporary user defaults file: ' . $tmp);
+    }
+
+    if (!rename($tmp, $path)) {
+        @unlink($tmp);
+        throw new RuntimeException('Could not replace user defaults file: ' . $path);
+    }
+    invalidate_user_defaults_config_cache();
+}
+
+function clear_legacy_default_config_db_values(SQLite3 $db): void {
+    foreach (array_keys(default_variable_config_builtin_defaults()) as $name) {
+        $stmt = $db->prepare('DELETE FROM app_config WHERE key = :key');
+        $stmt->bindValue(':key', default_config_key($name), SQLITE3_TEXT);
+        $stmt->execute();
+    }
+
+    foreach ([
+        'vendor_id_amazon',
+        'vendor_id_costco',
+        'vendor_id_walmart',
+        'vendor_id_lowes',
+        'vendor_id_home_depot',
+        'vendor_id_tractor_supply',
+    ] as $legacyKey) {
+        $stmt = $db->prepare('DELETE FROM app_config WHERE key = :key');
+        $stmt->bindValue(':key', $legacyKey, SQLITE3_TEXT);
+        $stmt->execute();
+    }
+}
+
 function default_variable_config_metadata(): array {
     return [
         'DEFAULT_VENDOR_AMAZON' => ['label'=>'Amazon vendor ID', 'group'=>'Vendor IDs', 'status'=>'Active importer'],
@@ -148,21 +249,16 @@ function default_config_cache_reset(): void {
 function default_config_value(string $defaultName, ?SQLite3 $db = null): string {
     $defaults = default_variable_config_defaults();
     $defaultName = strtoupper(trim($defaultName));
-    if (!array_key_exists($defaultName, $defaults)) return '';
-    $key = default_config_key($defaultName);
-    if ($db instanceof SQLite3) return get_config($db, $key, (string)$defaults[$defaultName]);
-    if (!isset($GLOBALS['_default_config_cache']) || !is_array($GLOBALS['_default_config_cache'])) {
-        $keys = [];
-        foreach (array_keys($defaults) as $name) $keys[] = default_config_key($name);
-        $GLOBALS['_default_config_cache'] = read_app_config_values($keys);
-    }
-    return (string)($GLOBALS['_default_config_cache'][$key] ?? $defaults[$defaultName]);
+
+    return array_key_exists($defaultName, $defaults)
+        ? (string)$defaults[$defaultName]
+        : '';
 }
+
 function default_config_values(?SQLite3 $db = null): array {
-    $out = [];
-    foreach (default_variable_config_defaults() as $name => $default) $out[$name] = default_config_value($name, $db);
-    return $out;
+    return default_variable_config_defaults();
 }
+
 function lowes_payment_match_date_window_days(?SQLite3 $db = null): int {
     $raw = trim((string)default_config_value('DEFAULT_LOWES_PAYMENT_MATCH_DATE_WINDOW_DAYS', $db));
     if ($raw === '' || !preg_match('/^-?\d+$/', $raw)) return 14;
@@ -210,22 +306,11 @@ function render_lowes_step5_controls(SQLite3 $db, string $modeValue, string $ven
 }
 function save_default_config_values(SQLite3 $db, array $request): void {
     $posted = (array)($request['default_var'] ?? []);
-    foreach (default_variable_config_defaults() as $name => $default) {
-        $value = array_key_exists($name, $posted) ? trim((string)$posted[$name]) : (string)$default;
-        set_config($db, default_config_key($name), $value);
-    }
-    // Keep v154/v155-era vendor_id_* keys in sync for users who already tested those builds.
-    $legacyMap = [
-        'vendor_id_amazon' => 'DEFAULT_VENDOR_AMAZON',
-        'vendor_id_costco' => 'DEFAULT_VENDOR_COSTCO',
-        'vendor_id_walmart' => 'DEFAULT_VENDOR_WALMART',
-        'vendor_id_lowes' => 'DEFAULT_VENDOR_LOWES',
-        'vendor_id_home_depot' => 'DEFAULT_VENDOR_HOME_DEPOT',
-        'vendor_id_tractor_supply' => 'DEFAULT_VENDOR_TRACTOR_SUPPLY',
-    ];
-    foreach ($legacyMap as $legacyKey => $defaultName) set_config($db, $legacyKey, default_config_value($defaultName, $db));
+    write_user_default_config($posted);
+    clear_legacy_default_config_db_values($db);
     default_config_cache_reset();
 }
+
 
 function h(?string $s): string { return htmlspecialchars($s ?? '', ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); }
 
@@ -8091,23 +8176,31 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         [$ok, $msg] = add_extra_account($db, (string)($request['account_name'] ?? ''));
         respond_json(['ok'=>$ok, 'message'=>$msg, 'account'=>trim((string)($request['account_name'] ?? ''))]);
     }
-    if (in_array(($request['action'] ?? ''), ['save_default_variables','save_vendor_ids'], true)) {
-        // save_vendor_ids is accepted for compatibility with early v155 drafts.
-        if (($request['action'] ?? '') === 'save_vendor_ids') {
-            $request['default_var'] = [
-                'DEFAULT_VENDOR_AMAZON' => (string)($request['vendor_id_amazon'] ?? default_config_value('DEFAULT_VENDOR_AMAZON', $db)),
-                'DEFAULT_VENDOR_COSTCO' => (string)($request['vendor_id_costco'] ?? default_config_value('DEFAULT_VENDOR_COSTCO', $db)),
-                'DEFAULT_VENDOR_WALMART' => (string)($request['vendor_id_walmart'] ?? default_config_value('DEFAULT_VENDOR_WALMART', $db)),
-                'DEFAULT_VENDOR_LOWES' => (string)($request['vendor_id_lowes'] ?? default_config_value('DEFAULT_VENDOR_LOWES', $db)),
-                'DEFAULT_VENDOR_HOME_DEPOT' => (string)($request['vendor_id_home_depot'] ?? default_config_value('DEFAULT_VENDOR_HOME_DEPOT', $db)),
-                'DEFAULT_VENDOR_TRACTOR_SUPPLY' => (string)($request['vendor_id_tractor_supply'] ?? default_config_value('DEFAULT_VENDOR_TRACTOR_SUPPLY', $db)),
-            ];
-        }
-        save_default_config_values($db, $request);
-        $message = "Saved default-variable configuration. Lowe's vendor ID is " . default_config_value('DEFAULT_VENDOR_LOWES', $db) . '. Home Depot placeholder and Tractor Supply defaults were retained.';
-        $mode = 'config';
-        set_config($db, 'ui_mode', $mode);
-    }
+if (($request['action'] ?? '') === 'save_vendor_ids') {
+    // save_vendor_ids is accepted for compatibility with early v155 drafts.
+    $request['default_var'] = [
+        'DEFAULT_VENDOR_AMAZON' => (string)($request['vendor_id_amazon'] ?? default_config_value('DEFAULT_VENDOR_AMAZON', $db)),
+        'DEFAULT_VENDOR_COSTCO' => (string)($request['vendor_id_costco'] ?? default_config_value('DEFAULT_VENDOR_COSTCO', $db)),
+        'DEFAULT_VENDOR_WALMART' => (string)($request['vendor_id_walmart'] ?? default_config_value('DEFAULT_VENDOR_WALMART', $db)),
+        'DEFAULT_VENDOR_LOWES' => (string)($request['vendor_id_lowes'] ?? default_config_value('DEFAULT_VENDOR_LOWES', $db)),
+        'DEFAULT_VENDOR_HOME_DEPOT' => (string)($request['vendor_id_home_depot'] ?? default_config_value('DEFAULT_VENDOR_HOME_DEPOT', $db)),
+        'DEFAULT_VENDOR_TRACTOR_SUPPLY' => (string)($request['vendor_id_tractor_supply'] ?? default_config_value('DEFAULT_VENDOR_TRACTOR_SUPPLY', $db)),
+    ];
+
+    save_default_config_values($db, $request);
+    set_config($db, 'ui_mode', 'config');
+
+    header('Location: ?mode=config&saved=vendor_ids#default-variables');
+    exit;
+}
+
+if (($request['action'] ?? '') === 'save_default_variables') {
+    save_default_config_values($db, $request);
+    set_config($db, 'ui_mode', 'config');
+
+    header('Location: ?mode=config&saved=default_variables#default-variables');
+    exit;
+}
     if (($request['action'] ?? '') === 'add_account') {
         [$ok, $msg] = add_extra_account($db, (string)($request['account_name'] ?? ''));
         if ($ok) $message = $msg; else $error = $msg;
@@ -9412,7 +9505,7 @@ th,td { border:1px solid #ddd; padding:0.35rem; vertical-align:top; overflow-wra
 </div>
 <?php endif; ?>
 <?php if($mode==='config'): ?>
-<div class="card" id="default-config"><h2>Default variables control panel</h2>
+<div class="card" id="default-variables"><h2>Default variables control panel</h2>
 <p class="small">These values replace the hard-coded <code>DEFAULT_...</code> variables used by imports, exports, payment hints, and account suggestions. They are stored in this tool's local review database. The constants in the PHP file remain fallback values only.</p>
 <form method="post"><input type="hidden" name="action" value="save_default_variables"><input type="hidden" name="mode" value="config">
 <table><thead><tr><th>Variable</th><th>Value</th><th>Use/status</th></tr></thead><tbody>
