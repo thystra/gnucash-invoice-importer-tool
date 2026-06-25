@@ -22,7 +22,7 @@ const DEFAULT_TAX_ACCOUNT = 'Expenses:Tax:Sales Tax';
 const DEFAULT_SHIPPING_ACCOUNT = 'Expenses:Shipping';
 const DEFAULT_GIFT_WRAP_ACCOUNT = 'Expenses:Gifts Given';
 if (function_exists('set_time_limit')) { @set_time_limit(300); }
-const DEFAULT_PAYMENT_ACCOUNT_AMAZON = 'Liabilities:Credit Cards:Amazon Chase Card 2246';
+const DEFAULT_PAYMENT_ACCOUNT_AMAZON = 'Liabilities:Credit Cards:Amazon Credit Card';
 const DEFAULT_REWARDS_ACCOUNT_AMAZON = 'Assets:Other Current Assets:Amazon Credit Card Cash Back';
 const DEFAULT_GIFT_CARD_RETURNS_ACCOUNT_AMAZON = 'Assets:Other Current Assets:Amazon Gift Card (Returns)';
 const DEFAULT_PRIME_YOUNG_CASHBACK_ACCOUNT_AMAZON = 'Assets:Other Current Assets:Amazon Prime for Young Adults cash back';
