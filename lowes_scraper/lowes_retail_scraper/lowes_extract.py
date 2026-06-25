@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Alan Johnson
+# SPDX-License-Identifier: GPL-3.0-or-later
 """
 lowes_extract.py - local Lowe's retail purchase-history scraper/parser. v10 payment classification build.
 
