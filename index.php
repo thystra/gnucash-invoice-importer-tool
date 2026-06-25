@@ -1,7 +1,11 @@
 <?php
 // Local-only Amazon/Costco/Walmart/Lowes order review tool for GnuCash bill CSV import.
 // Run with: php -S 127.0.0.1:8080 -t /path/to/gnucash_vendor_import_tool
-// Donation/support banner settings.
+/*
+ * SPDX-FileCopyrightText: 2026 Alan Johnson
+ * SPDX-License-Identifier: GPL-3.0-or-later
+ */
+
 
 declare(strict_types=1);
 
@@ -30,6 +34,8 @@ const DEFAULT_STORED_VALUE_ACCOUNT_TRACTOR_SUPPLY = '';
 const DEFAULT_LOWES_PAYMENT_MATCH_DATE_WINDOW_DAYS = '14';
 const DEFAULT_LOWES_PARTIAL_RETURN_MANUAL_STAGE_MIN_AMOUNT = '100.00';
 const DEFAULT_AP_ACCOUNT = 'Liabilities:Accounts Payable';
+
+// Donation/support banner settings.
 // Set GNUCASH_TOOL_SHOW_DONATION_BANNER=0 to hide.
 // Set GNUCASH_TOOL_DONATION_URL to override the default support link.
 $donationUrl = getenv('GNUCASH_TOOL_DONATION_URL') ?: 'https://ko-fi.com/thewolfandtheraven';
