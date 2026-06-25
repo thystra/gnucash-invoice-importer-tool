@@ -1,5 +1,9 @@
 # Changelog
 
+## v206
+- change default settings to be stored in config/user_defaults.example.php.
+- ```cp -n config/user_defaults.example.php config/user_defaults.php``` to make a local copy. 
+
 ## v204
 - Tractor Supply bill CSV export now forces posted bill fields for TSC rows (`date_posted`, `due_date`, `account_posted`, and posted memo) even if the global **Post invoices** checkbox was not enabled. This prevents successfully imported TSC bills from appearing missing/unposted in GnuCash.
 - Export validation now validates the configured Accounts Payable posting account whenever the selected batch contains Tractor Supply rows.
