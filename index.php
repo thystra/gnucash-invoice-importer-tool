@@ -9431,6 +9431,7 @@ sudo systemctl restart php8.5-fpm</textarea>
 </div>
 <?php endif; ?>
 <?php if($mode==='import_data'): ?>
+<?php render_donation_banner($donationUrl, $showDonationBanner); ?>
 <div class="card" id="import-data"><h2>3. Import Data</h2>
 <p class="small">Vendor plugins gather or normalize source data, then feed the same shared bill/line-item engine. Use this page for vendor-specific import instructions and stored-value exports. After data is imported, go to <strong>Review Bills &amp; Line Items</strong>.</p>
 <div class="wizard-steps">
