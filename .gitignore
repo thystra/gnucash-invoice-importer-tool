@@ -84,3 +84,9 @@ tractorsupply_scraper/**/raw_html/
 **/raw_html/
 **/*-normalized.zip
 **/*-tsc.zip
+
+# Temporary/editor backup files
+*.tmp
+*.bak
+*.orig
+*.rej
