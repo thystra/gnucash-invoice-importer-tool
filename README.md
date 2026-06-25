@@ -1,3 +1,13 @@
+## Support
+
+GnuCash Vendor Import Tool is free and open source software.
+
+If this project saves you time, helps clean up your books, or supports your small business/farm accounting workflow, optional donations help fund continued maintenance and new vendor modules.
+
+Support development: https://ko-fi.com/thewolfandtheraven
+
+Donations are appreciated but never required.
+
 # GnuCash Vendor Bill Tool v204
 
 Local web tool for staging vendor orders as GnuCash vendor bill CSVs, reviewing line-item categories, exporting payment/stored-value rows, and auditing/matching imported payments.
