@@ -1,6 +1,12 @@
 <?php
 // Local-only Amazon/Costco/Walmart/Lowes order review tool for GnuCash bill CSV import.
 // Run with: php -S 127.0.0.1:8080 -t /path/to/gnucash_vendor_import_tool
+// Donation/support banner settings.
+// Set GNUCASH_TOOL_SHOW_DONATION_BANNER=0 to hide.
+// Set GNUCASH_TOOL_DONATION_URL to override the default support link.
+$donationUrl = getenv('GNUCASH_TOOL_DONATION_URL') ?: 'https://ko-fi.com/thewolfandtheraven';
+$showDonationBanner = getenv('GNUCASH_TOOL_SHOW_DONATION_BANNER') !== '0';
+
 
 declare(strict_types=1);
 
@@ -82,6 +88,24 @@ function default_variable_config_metadata(): array {
         'DEFAULT_LOWES_PAYMENT_MATCH_DATE_WINDOW_DAYS' => ['label'=>"Lowe's payment posting-lag tolerance, days", 'group'=>"Lowe's module settings", 'status'=>"Forward-looking window for online-order ship/charge settlement matching in Step 5a"],
         'DEFAULT_LOWES_PARTIAL_RETURN_MANUAL_STAGE_MIN_AMOUNT' => ['label'=>"Lowe's partial-return manual-stage minimum amount", 'group'=>"Lowe's module settings", 'status'=>"Returned lines at or above this amount are staged as reviewable CREDIT memos even when exact refund evidence is not found during import"],
     ];
+}
+function render_donation_banner(string $donationUrl, bool $showDonationBanner): void
+{
+    if (!$showDonationBanner || trim($donationUrl) === '') {
+        return;
+    }
+
+    $safeUrl = htmlspecialchars($donationUrl, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+
+    echo <<<HTML
+<div class="donation-card">
+  <div>
+    <strong>GnuCash Vendor Import Tool is free and open source.</strong>
+    <span>If this project saves you time, optional donations help fund continued maintenance and new vendor modules.</span>
+  </div>
+  <a href="{$safeUrl}" target="_blank" rel="noopener noreferrer">Support development</a>
+</div>
+HTML;
 }
 function default_config_key(string $defaultName): string {
     return 'default_var_' . preg_replace('/[^A-Z0-9_]+/', '_', strtoupper(trim($defaultName)));
@@ -9285,6 +9309,28 @@ input[type=text], input[type=number], input[type=date], select { max-width:100%;
 th,td { border:1px solid #ddd; padding:0.35rem; vertical-align:top; overflow-wrap:anywhere; word-break:normal; } th { background:#f0f0f0; position:sticky; top:0; } .warn { color:#9a5b00; font-weight:600; } .small { font-size:0.84rem; color:#555; } button { padding:0.45rem 0.8rem; } pre.command-box, textarea.command-box { width:100%; max-width:100%; box-sizing:border-box; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace; font-size:.86rem; white-space:pre; overflow:auto; background:#111827; color:#f9fafb; border:1px solid #374151; border-radius:8px; padding:.75rem; } textarea.command-box { min-height:10rem; resize:vertical; } .msg { background:#e6ffed; border-color:#b7ebc6; } .err { background:#ffecec; border-color:#e0aaaa; } .itemrow td { background:#fcfcff; } .itemrow-uncategorized td { background:#fff1e6; } .itemrow-categorized td { background:#edf9f0; } .itemrow-invalid-account td { background:#fff7d6; } .itemrow-uncategorized input[name$="[expense_account]"] { border:2px solid #d9822b; background:#fffaf5; } .itemrow-categorized input[name$="[expense_account]"] { border:2px solid #72b879; background:#fbfffb; } .itemrow-invalid-account input[name$="[expense_account]"] { border:2px solid #d6a100; background:#fffdf2; } .category-legend{display:flex;gap:.75rem;flex-wrap:wrap;align-items:center;margin:.45rem 0}.category-chip{display:inline-flex;align-items:center;gap:.35rem}.category-swatch{display:inline-block;width:1rem;height:1rem;border:1px solid #bbb;border-radius:3px}.category-swatch.uncat{background:#fff1e6;border-color:#d9822b}.category-swatch.cat{background:#edf9f0;border-color:#72b879}.category-swatch.invalid{background:#fff7d6;border-color:#d6a100}.orderrow td { background:#f8f8f8; font-weight:600; } .ordercard{border:1px solid #ddd;border-radius:8px;padding:.75rem;margin:1rem 0;background:#fff;overflow-x:hidden;max-width:100%;box-sizing:border-box}.orderhead{display:flex;gap:1rem;align-items:center;background:#f4f4f4;padding:.4rem;border-radius:6px;flex-wrap:wrap}.grid4{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:.5rem}.grid3{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr) minmax(0,2fr);gap:.5rem}.grid2{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:.5rem}.items{margin-top:.75rem;table-layout:fixed;width:100%;max-width:100%;min-width:0}.items th{position:relative}.items th,.items td{overflow:hidden;text-overflow:clip}.items td:nth-child(3){overflow-wrap:anywhere;word-break:break-word;hyphens:auto}.items td:nth-child(5) input{min-width:100%;font-family:monospace}.items td:nth-child(4) input{max-width:7.5rem}.export-controls form,.responsive-form{max-width:100%;grid-template-columns:repeat(auto-fit,minmax(9rem,auto)) !important}.export-controls label{min-width:0}.export-controls .small{min-width:14rem}.col-resizer{position:absolute;right:-3px;top:0;width:7px;height:100%;cursor:col-resize;user-select:none;z-index:5}.col-resizer:hover,.col-resizing .col-resizer{background:rgba(0,0,0,.12)}.resize-help{font-size:.82rem;color:#555;margin:.25rem 0}.ordercard:target{outline:3px solid #d39e00;background:#fff8df}tr:target td{outline:2px solid #d39e00;background:#fff8df}.tabs{display:flex;gap:.35rem;margin:.75rem 0 1rem 0;border-bottom:1px solid #ccc}.wizard-steps{display:flex;gap:.4rem;flex-wrap:wrap;margin:.5rem 0 1rem}.wizard-step{padding:.4rem .65rem;border:1px solid #ccc;border-radius:999px;background:#f7f7f7;text-decoration:none;color:#222}.wizard-step.active{background:#d1ecf1;border-color:#0c5460;font-weight:700}.wizard-step.blocked{background:#fff3cd;border-color:#d39e00}.wizard-step.ok{background:#e6ffed;border-color:#7abf8a}.status-pill{display:inline-block;padding:.12rem .45rem;border-radius:999px;background:#eee;margin:.08rem}.tab{display:inline-block;padding:.55rem .9rem;border:1px solid #ccc;border-bottom:none;border-radius:8px 8px 0 0;background:#f2f2f2;text-decoration:none;color:#222}.tab.active{background:#fff;font-weight:700}.tab .small{margin-left:.25rem}.mode-note{background:#f7f7ff;border:1px solid #c8c8ea;border-radius:8px;padding:.65rem;margin:.5rem 0 1rem}.payment-lines{width:100%;border-collapse:collapse}.payment-lines th,.payment-lines td{font-size:.9rem;padding:.2rem .3rem}.payment-lines th{position:static;background:#f7f7f7}.orderpay-mismatch{background:#fff3cd}.orderpay-ok{background:#e6ffed}.pay-present{color:#176d2f;font-weight:700}.pay-missing{color:#9a1f1f;font-weight:700}.pay-warn{color:#9a5b00;font-weight:700}.mini-form{display:inline;margin:0}.mini-form button{padding:.15rem .35rem;font-size:.8rem}.invoice-actions{display:flex;gap:.4rem;align-items:end;flex-wrap:wrap}.invoice-actions label{font-weight:400}.invoice-actions input{min-width:18rem}.invoice-actions button{padding:.35rem .55rem}.collapsible-step>summary{cursor:pointer;font-weight:700;font-size:1.15rem}.collapsible-step[open]>summary{margin-bottom:.75rem}.action-report{scroll-margin-top:1rem}.action-report ul{margin-top:.4rem}
 @media(max-width:900px){.grid4,.grid3,.grid2{grid-template-columns:1fr}.tabs{flex-wrap:wrap}}
 
+.donation-card {
+    margin: 0 0 1rem 0;
+    padding: 0.75rem 1rem;
+    border: 1px solid #d8d8d8;
+    border-radius: 8px;
+    background: #fafafa;
+    display: flex;
+    justify-content: space-between;
+    gap: 1rem;
+    align-items: center;
+}
+
+.donation-card span {
+    display: block;
+    margin-top: 0.25rem;
+    color: #555;
+}
+
+.donation-card a {
+    white-space: nowrap;
+}
+    
 .lowes-dry-run-problems { table-layout: fixed; width: 100%; }
 .lowes-dry-run-problems th, .lowes-dry-run-problems td { white-space: normal; overflow-wrap: anywhere; vertical-align: top; }
 .lowes-dry-run-problems .select-col { width: 3.5rem; text-align: center; }
