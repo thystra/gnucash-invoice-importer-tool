@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """
+# SPDX-FileCopyrightText: 2026 Alan Johnson
+# SPDX-License-Identifier: GPL-3.0-or-later
 GnuCash invoice Date Opened repair helper.
 
 Reads an Amazon order-level CSV (columns: "order id", "date") and updates the
