@@ -1,3 +1,12 @@
+
+## License
+
+GnuCash Vendor Import Tool is licensed under the GNU General Public License v3.0 or later.
+
+SPDX license identifier: `GPL-3.0-or-later`
+
+See `LICENSE` for the full license text.
+
 ## Support
 
 GnuCash Vendor Import Tool is free and open source software.
