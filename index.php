@@ -9346,7 +9346,7 @@ th,td { border:1px solid #ddd; padding:0.35rem; vertical-align:top; overflow-wra
     padding: 0.75rem 1rem;
     border: 1px solid #d8d8d8;
     border-radius: 8px;
-    background: #fafafa;
+    background: #eef7ff;
     display: flex;
     justify-content: space-between;
     gap: 1rem;
