@@ -15,8 +15,8 @@ const DEFAULT_VENDOR_AMAZON = '000005';
 const DEFAULT_VENDOR_COSTCO = '000001';
 const DEFAULT_VENDOR_WALMART = '000006';
 const DEFAULT_VENDOR_LOWES = '000020';
-const DEFAULT_VENDOR_HOME_DEPOT = '';
-const DEFAULT_VENDOR_TRACTOR_SUPPLY = '';
+const DEFAULT_VENDOR_HOME_DEPOT = '000000';
+const DEFAULT_VENDOR_TRACTOR_SUPPLY = '000000';
 const DEFAULT_PAYMENT_ACCOUNT_HOME_DEPOT = '';
 const DEFAULT_TAX_ACCOUNT = 'Expenses:Tax:Sales Tax';
 const DEFAULT_SHIPPING_ACCOUNT = 'Expenses:Shipping';
@@ -41,7 +41,31 @@ const DEFAULT_AP_ACCOUNT = 'Liabilities:Accounts Payable';
 $donationUrl = getenv('GNUCASH_TOOL_DONATION_URL') ?: 'https://ko-fi.com/thewolfandtheraven';
 $showDonationBanner = getenv('GNUCASH_TOOL_SHOW_DONATION_BANNER') !== '0';
 
+function load_user_default_config_overrides(): array
+{
+    $path = __DIR__ . '/config/user_defaults.php';
 
+    if (!is_readable($path)) {
+        return [];
+    }
+
+    $data = require $path;
+
+    if (!is_array($data)) {
+        return [];
+    }
+
+    $out = [];
+    foreach ($data as $key => $value) {
+        $key = strtoupper(trim((string)$key));
+        if ($key === '') {
+            continue;
+        }
+        $out[$key] = is_scalar($value) || $value === null ? (string)$value : '';
+    }
+
+    return $out;
+}
 
 function default_variable_config_defaults(): array {
     return [
@@ -68,6 +92,8 @@ function default_variable_config_defaults(): array {
         'DEFAULT_LOWES_PARTIAL_RETURN_MANUAL_STAGE_MIN_AMOUNT' => DEFAULT_LOWES_PARTIAL_RETURN_MANUAL_STAGE_MIN_AMOUNT,
         'DEFAULT_AP_ACCOUNT' => DEFAULT_AP_ACCOUNT,
     ];
+    $overrides = load_user_default_config_overrides();
+    return array_replace($defaults, array_intersect_key($overrides, $defaults));
 }
 function default_variable_config_metadata(): array {
     return [
