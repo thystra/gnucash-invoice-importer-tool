@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 """
+# SPDX-FileCopyrightText: 2026 Alan Johnson
+# SPDX-License-Identifier: GPL-3.0-or-later
+
 GnuCash Amazon CREDIT/refund matcher v1 (v128 package).
 
 Matches posted Amazon *-CREDIT vendor bills to existing refund/stored-value
