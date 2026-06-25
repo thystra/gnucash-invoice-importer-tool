@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Alan Johnson
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Refresh all supported vendor scrapers into normalized ZIPs.
 
 Run this from the tool root after starting Chrome/Chromium with
