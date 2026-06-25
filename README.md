@@ -55,7 +55,15 @@ $USER     = edits the files
 nginx    = serves static files
 www-data = PHP-FPM reads/executes PHP files
 ```
+## Vendor defaults and settings. 
 
+Defaults are stored in ```config/user_defaults.php```. Copy the example to make a local copy. 
+```cp -n config/user_defaults.example.php config/user_defaults.php``` to make a local copy.
+
+These values replace the hard-coded DEFAULT_... variables used by imports, exports, payment hints, and account suggestions. 
+They are stored in config/user_defaults.php, which is ignored by Git and survives hard resets. The constants in index.php remain fallback values only.
+
+## Ingesting data
 
 To scrape Lowe's or TSC transactions, you will need the Chromium browser snap package. 
 
