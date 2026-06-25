@@ -90,3 +90,7 @@ tractorsupply_scraper/**/raw_html/
 *.bak
 *.orig
 *.rej
+
+# Local user/site configuration
+config/user_defaults.php
+config/*.local.php
