@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """
+# SPDX-FileCopyrightText: 2026 Alan Johnson
+# SPDX-License-Identifier: GPL-3.0-or-later
 GnuCash vendor payment apply script v1.5 (v167 package).
 
 Applies vendor payment rows from the vendor import tool's
