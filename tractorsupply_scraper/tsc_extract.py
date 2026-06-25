@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 Alan Johnson
+# SPDX-License-Identifier: GPL-3.0-or-later
 """Parse or capture Tractor Supply order pages into normalized CSVs.
 
 Modes:
