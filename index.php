@@ -9,7 +9,7 @@
 
 declare(strict_types=1);
 
-const APP_VERSION = 'v207n';
+const APP_VERSION = 'v207o';
 const APP_DB = __DIR__ . '/data/review.sqlite';
 const DEFAULT_VENDOR_AMAZON = '000005';
 const DEFAULT_VENDOR_COSTCO = '000001';
@@ -9923,9 +9923,9 @@ sudo systemctl restart php8.5-fpm</textarea>
 <?php endif; ?>
 <?php if($mode==='matching'): ?>
 <div class="card" id="transaction-matching"><h2>5. Transaction Matching</h2><p class="small">Run dry-run/apply workflows after the bill CSVs and relevant bank/card/stored-value register transactions are imported into the uploaded GnuCash copy.</p>
-<div class="wizard-steps"><a class="wizard-step" href="#matching-lowes">Lowe's</a><a class="wizard-step" href="#matching-amazon">Amazon</a><a class="wizard-step" href="#matching-register-scans">Free-floating scans</a></div></div>
+<div class="wizard-steps"><a class="wizard-step" href="#matching-lowes">Lowe's</a><a class="wizard-step" href="?mode=transactions&payment_wizard_step=start#payment-wizard">Amazon payment wizard</a><a class="wizard-step" href="#matching-register-scans">Free-floating scans</a></div></div>
 <div class="card" id="matching-lowes"><h3>Lowe's matching</h3><p><a class="wizard-step" href="?mode=lowes&vendor_step=match_dry_run#lowes-payment-dry-run">5a. Lowe's dry run</a> <a class="wizard-step" href="?mode=lowes&vendor_step=match_apply#lowes-payment-apply">5b. Lowe's apply</a> <a class="wizard-step" href="?mode=lowes&vendor_step=stored_value#lowes-stored-value-export">My Lowe's Money export</a></p></div>
-<div class="card" id="matching-amazon"><h3>Amazon matching</h3><p><a class="wizard-step" href="?mode=transactions&payment_wizard_step=start#payment-wizard">Open Amazon payment wizard</a></p></div>
+<div class="card" id="matching-amazon"><h3>Amazon matching</h3><p class="small">Amazon payment matching uses the dedicated payment wizard for transaction-history CSVs, payment-method mapping, missing-invoice checks, exceptions, and payment application.</p><p><a class="wizard-step" href="?mode=transactions&payment_wizard_step=start#payment-wizard">Open Amazon payment wizard</a></p></div>
 <div class="card" id="matching-register-scans"><h3>Vendor free-floating register scans</h3><p class="small">Use these to find vendor-like card/register transactions that are not attached to A/P lots or a current matching result.</p><div class="wizard-steps"><?php foreach(['amazon','costco','walmart','lowes','home_depot','tractor_supply'] as $scanV): $scanLabel = vendor_config($scanV)['label'] ?? ucfirst(str_replace('_',' ', $scanV)); ?><a class="wizard-step" href="?mode=<?=h($scanV)?>&vendor_step=payments#vendor-unmatched-register-scan"><?=h($scanLabel)?></a><?php endforeach; ?></div></div>
 <?php endif; ?>
 <?php if(in_array($mode, ['amazon','costco','walmart','home_depot','tractor_supply'], true)): ?>
