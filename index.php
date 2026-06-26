@@ -9,7 +9,7 @@
 
 declare(strict_types=1);
 
-const APP_VERSION = 'v207i';
+const APP_VERSION = 'v207j';
 const APP_DB = __DIR__ . '/data/review.sqlite';
 const DEFAULT_VENDOR_AMAZON = '000005';
 const DEFAULT_VENDOR_COSTCO = '000001';
@@ -7986,6 +7986,28 @@ function set_invoice_items_category(SQLite3 $db, string $vendor, string $order_i
     return [$changed, 'Set the fallback expense category on no-item invoice ' . $order_id . ' to ' . $account . '.'];
 }
 
+function set_order_post_only_invoice(SQLite3 $db, string $vendor, string $orderId, bool $enabled): bool {
+    $vendor = strtolower(trim($vendor));
+    $orderId = trim($orderId);
+
+    if ($vendor === '' || $orderId === '') {
+        return false;
+    }
+
+    $stmt = $db->prepare('UPDATE orders SET post_only_invoice=:enabled WHERE vendor=:vendor AND order_id=:order_id');
+    $stmt->bindValue(':enabled', $enabled ? 1 : 0, SQLITE3_INTEGER);
+    $stmt->bindValue(':vendor', $vendor, SQLITE3_TEXT);
+    $stmt->bindValue(':order_id', $orderId, SQLITE3_TEXT);
+
+    if (function_exists('retry_sqlite_write')) {
+        retry_sqlite_write(fn() => $stmt->execute());
+    } else {
+        $stmt->execute();
+    }
+
+    return $db->changes() > 0;
+}
+
 function save_review_edits(SQLite3 $db, array $post): void {
     $last = null;
     for ($attempt = 1; $attempt <= 5; $attempt++) {
@@ -9448,7 +9470,35 @@ if (($request['action'] ?? '') === 'save_default_variables') {
             }
         }
     }
-    if (($request['action'] ?? '') === 'save') {
+    if (($request['action'] ?? '') === 'set_post_only_invoice') {
+    $ok = false;
+    $vendor = (string)($request['vendor'] ?? '');
+    $orderId = (string)($request['order_id'] ?? '');
+    $enabled = (string)($request['enabled'] ?? '0') === '1';
+
+    try {
+        $ok = set_order_post_only_invoice($db, $vendor, $orderId, $enabled);
+    } catch (Throwable $e) {
+        if (($request['ajax'] ?? '') === '1') {
+            header('Content-Type: application/json');
+            echo json_encode(['ok' => false, 'error' => $e->getMessage()]);
+            exit;
+        }
+        throw $e;
+    }
+
+    if (($request['ajax'] ?? '') === '1') {
+        header('Content-Type: application/json');
+        echo json_encode(['ok' => $ok, 'vendor' => strtolower(trim($vendor)), 'order_id' => trim($orderId), 'enabled' => $enabled]);
+        exit;
+    }
+
+    $message = $ok ? 'Saved post-only invoice setting.' : 'No matching staged invoice was found for the post-only invoice setting.';
+    $mode = 'bills';
+    set_config($db, 'ui_mode', $mode);
+}
+
+if (($request['action'] ?? '') === 'save') {
         try {
             save_review_edits($db, $request);
             if (isset($request['save_credit_return_items'])) {
@@ -10866,4 +10916,180 @@ CMD;
   });
 })();
 </script>
+<script>
+(function(){
+  function postOnlyInputs() {
+    var out = [];
+
+    document.querySelectorAll('label').forEach(function(label) {
+      if ((label.textContent || '').indexOf('Post only invoice') === -1) return;
+      var cb = label.querySelector('input[type="checkbox"]');
+      if (cb && out.indexOf(cb) === -1) out.push(cb);
+    });
+
+    document.querySelectorAll('input[type="checkbox"][name*="post_only"]').forEach(function(cb) {
+      if (out.indexOf(cb) === -1) out.push(cb);
+    });
+
+    document.querySelectorAll('input[type="checkbox"][data-post-only-invoice-autosave]').forEach(function(cb) {
+      if (out.indexOf(cb) === -1) out.push(cb);
+    });
+
+    return out;
+  }
+
+  function orderIdentityFromInput(cb) {
+    var vendor = (cb.dataset.vendor || '').trim();
+    var orderId = (cb.dataset.orderId || cb.dataset.orderid || '').trim();
+
+    if (vendor !== '' && orderId !== '') {
+      return {vendor: vendor, order_id: orderId};
+    }
+
+    var key = '';
+    var name = cb.getAttribute('name') || '';
+    var m = name.match(/\[([^\]]+)\]/);
+    if (m) key = m[1];
+
+    if (key === '' && cb.value && cb.value.indexOf('|') !== -1) {
+      key = cb.value;
+    }
+
+    if (key.indexOf('|') !== -1) {
+      var parts = key.split('|');
+      vendor = (parts.shift() || '').trim();
+      orderId = parts.join('|').trim();
+      if (vendor !== '' && orderId !== '') {
+        return {vendor: vendor, order_id: orderId};
+      }
+    }
+
+    var holder = cb.closest('[data-vendor][data-order-id], [data-vendor][data-orderid]');
+    if (holder) {
+      vendor = (holder.dataset.vendor || '').trim();
+      orderId = (holder.dataset.orderId || holder.dataset.orderid || '').trim();
+      if (vendor !== '' && orderId !== '') {
+        return {vendor: vendor, order_id: orderId};
+      }
+    }
+
+    return null;
+  }
+
+  var pending = [];
+
+  function syncPostOnly(cb) {
+    var ident = orderIdentityFromInput(cb);
+    if (!ident) {
+      console.warn('Could not determine invoice identity for Post only invoice checkbox', cb);
+      return Promise.resolve(false);
+    }
+
+    var fd = new FormData();
+    fd.set('action', 'set_post_only_invoice');
+    fd.set('ajax', '1');
+    fd.set('mode', 'bills');
+    fd.set('vendor', ident.vendor);
+    fd.set('order_id', ident.order_id);
+    fd.set('enabled', cb.checked ? '1' : '0');
+
+    cb.dataset.postOnlySaving = '1';
+
+    var p = fetch(window.location.pathname + window.location.search, {
+      method: 'POST',
+      credentials: 'same-origin',
+      body: fd
+    }).then(function(resp) {
+      if (!resp.ok) throw new Error('HTTP ' + resp.status);
+      return resp.json();
+    }).then(function(data) {
+      if (!data || !data.ok) throw new Error((data && data.error) ? data.error : 'Post-only autosave failed');
+      cb.dataset.postOnlySaved = cb.checked ? '1' : '0';
+      delete cb.dataset.postOnlyError;
+      return true;
+    }).catch(function(err) {
+      cb.dataset.postOnlyError = String(err && err.message ? err.message : err);
+      console.error('Post-only invoice autosave failed:', err);
+      alert('Could not save Post only invoice flag. Click "Save this invoice" before validating/exporting. Error: ' + cb.dataset.postOnlyError);
+      return false;
+    }).finally(function() {
+      delete cb.dataset.postOnlySaving;
+    });
+
+    pending.push(p);
+    p.finally(function() {
+      pending = pending.filter(function(x) { return x !== p; });
+    });
+
+    return p;
+  }
+
+  function syncVisiblePostOnlyInputs() {
+    var jobs = [];
+    postOnlyInputs().forEach(function(cb) {
+      var saved = cb.dataset.postOnlySaved;
+      var current = cb.checked ? '1' : '0';
+      if (saved !== current) {
+        jobs.push(syncPostOnly(cb));
+      }
+    });
+    return Promise.allSettled(jobs.concat(pending));
+  }
+
+  document.addEventListener('change', function(ev) {
+    var cb = ev.target;
+    if (!cb || cb.type !== 'checkbox') return;
+
+    var isPostOnly =
+      (cb.name || '').indexOf('post_only') !== -1 ||
+      cb.hasAttribute('data-post-only-invoice-autosave') ||
+      (cb.closest('label') && (cb.closest('label').textContent || '').indexOf('Post only invoice') !== -1);
+
+    if (!isPostOnly) return;
+
+    syncPostOnly(cb);
+  }, true);
+
+  document.addEventListener('submit', function(ev) {
+    var form = ev.target;
+    if (!form || !form.querySelector) return;
+
+    var actionField = form.querySelector('input[name="action"]');
+    var action = actionField ? actionField.value : '';
+
+    if (['validate_export', 'export', 'export_range'].indexOf(action) === -1) return;
+    if (form.dataset.postOnlySyncSubmit === '1') return;
+
+    ev.preventDefault();
+
+    syncVisiblePostOnlyInputs().then(function(results) {
+      var failed = results.some(function(r) {
+        if (r.status === 'rejected') return true;
+        if (Array.isArray(r.value)) {
+          return r.value.some(function(inner) {
+            return inner.status === 'rejected' || (inner.status === 'fulfilled' && inner.value === false);
+          });
+        }
+        return r.value === false;
+      });
+
+      if (failed) return;
+
+      form.dataset.postOnlySyncSubmit = '1';
+      if (form.requestSubmit) {
+        form.requestSubmit();
+      } else {
+        form.submit();
+      }
+    });
+  }, true);
+
+  document.addEventListener('DOMContentLoaded', function() {
+    postOnlyInputs().forEach(function(cb) {
+      cb.dataset.postOnlySaved = cb.checked ? '1' : '0';
+    });
+  });
+})();
+</script>
+
 </body></html>
