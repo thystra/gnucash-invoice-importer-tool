@@ -9,7 +9,7 @@
 
 declare(strict_types=1);
 
-const APP_VERSION = 'v207b';
+const APP_VERSION = 'v207f';
 const APP_DB = __DIR__ . '/data/review.sqlite';
 const DEFAULT_VENDOR_AMAZON = '000005';
 const DEFAULT_VENDOR_COSTCO = '000001';
@@ -543,6 +543,34 @@ function sqlite_exec_retry(SQLite3 $db, string $sql, int $tries = 8): bool {
     if ($last) throw $last;
     return false;
 }
+
+function retry_sqlite_write(callable $fn, int $tries = 8) {
+    $last = null;
+
+    for ($i = 0; $i < $tries; $i++) {
+        try {
+            $result = $fn();
+            if ($result !== false) {
+                return $result;
+            }
+        } catch (Throwable $e) {
+            $last = $e;
+            $msg = strtolower($e->getMessage());
+            if (!str_contains($msg, 'locked') && !str_contains($msg, 'busy')) {
+                throw $e;
+            }
+        }
+
+        usleep(250000 * ($i + 1));
+    }
+
+    if ($last) {
+        throw $last;
+    }
+
+    return false;
+}
+
 
 function clear_working_dataset(SQLite3 $db): void {
     // Soft clear should not touch account_rules or extra_accounts; those are the SKU/ASIN training data.
@@ -1091,13 +1119,14 @@ function vendor_config(string $vendor): array {
 }
 
 function vendor_requires_posted_bill_export(string $vendor): bool {
-    // v204: Tractor Supply bill imports should arrive in GnuCash as posted bills.
-    // GnuCash's business UI does not show unposted bill documents in the usual
-    // payable views, which made successful TSC imports look missing.  Keep the
-    // global Post invoices checkbox for other vendors, but force posting columns
-    // for TSC rows during validation and CSV export.
-    return strtolower(trim($vendor)) === 'tractor_supply';
+    // Amazon and Tractor Supply bill imports should arrive in GnuCash as posted bills.
+    // GnuCash's business UI does not show unposted bill documents in the usual payable
+    // views, which made successful imports look missing. Keep the global Post invoices
+    // checkbox for other vendors, but force posting columns for these vendor rows during
+    // validation and CSV export.
+    return in_array(strtolower(trim($vendor)), ['amazon', 'tractor_supply'], true);
 }
+
 
 function normalize_key_text(string $s): string {
     $s = strtolower(trim($s));
@@ -5775,17 +5804,95 @@ function recategorize_recent_manual_changes(SQLite3 $db): array {
     return [$changed, 'Applied ' . $rules . ' manually changed category reference(s) since the last bulk apply to ' . $changed . ' blank/Uncategorized matching row(s). ' . implode('; ', $messages) . '. Existing non-Uncategorized rows and locked rows were not changed.'];
 }
 
-function mark_existing_bills_to_skip(SQLite3 $db, string $gnucashPath): int {
-    $ids = load_existing_bill_ids($gnucashPath); if (!$ids) return 0; $n=0;
-    $res=$db->query('SELECT vendor, order_id, skip, warning FROM orders');
-    $stmt=$db->prepare('UPDATE orders SET skip=1, warning=trim(COALESCE(warning,"") || " Existing bill/invoice ID found in GnuCash; marked skip to avoid duplicate import.") WHERE vendor=:vendor AND order_id=:order_id');
-    while($r=$res->fetchArray(SQLITE3_ASSOC)){
-        if(isset($ids[canonical_order_id_for_export((string)$r['vendor'], (string)$r['order_id'])]) && !(int)$r['skip']){
-            $stmt->bindValue(':vendor',$r['vendor'],SQLITE3_TEXT); $stmt->bindValue(':order_id',$r['order_id'],SQLITE3_TEXT); $stmt->execute(); $n++;
+function staged_order_invoice_state_map(SQLite3 $db, string $gnucashPath): array {
+    $targets = [];
+    $res = $db->query('SELECT vendor, order_id, skip, warning FROM orders ORDER BY vendor, order_date, order_id');
+
+    while ($res && ($r = $res->fetchArray(SQLITE3_ASSOC))) {
+        $vendor = (string)($r['vendor'] ?? '');
+        $orderId = (string)($r['order_id'] ?? '');
+        if ($vendor === '' || $orderId === '') {
+            continue;
+        }
+
+        $canonical = canonical_order_id_for_export($vendor, $orderId);
+        if ($canonical === '') {
+            continue;
+        }
+
+        $targets[$canonical][] = [
+            'vendor' => $vendor,
+            'order_id' => $orderId,
+            'skip' => (int)($r['skip'] ?? 0),
+            'warning' => (string)($r['warning'] ?? ''),
+        ];
+    }
+
+    if (!$targets) {
+        return [];
+    }
+
+    $states = load_gnucash_invoice_states_for_payments($gnucashPath, array_keys($targets));
+    $out = [];
+
+    foreach ($targets as $invoiceId => $rows) {
+        $state = $states[$invoiceId] ?? invoice_empty_state($invoiceId);
+        foreach ($rows as $row) {
+            $out[$row['vendor'] . '|' . $row['order_id']] = [
+                'invoice_id' => $invoiceId,
+                'state' => $state,
+                'row' => $row,
+            ];
         }
     }
+
+    return $out;
+}
+
+function mark_existing_bills_to_skip(SQLite3 $db, string $gnucashPath): int {
+    $stateMap = staged_order_invoice_state_map($db, $gnucashPath);
+    if (!$stateMap) {
+        return 0;
+    }
+
+    $markPosted = $db->prepare('UPDATE orders SET skip=1, warning=trim(COALESCE(warning,"") || " Existing posted bill/invoice ID found in GnuCash; marked skip to avoid duplicate import.") WHERE vendor=:vendor AND order_id=:order_id AND COALESCE(skip,0)=0');
+    $warnUnposted = $db->prepare('UPDATE orders SET warning=trim(COALESCE(warning,"") || " Existing GnuCash bill/invoice ID found but it is not posted; not auto-skipped. Re-exporting as posted is allowed, or post/delete it manually before payment automation.") WHERE vendor=:vendor AND order_id=:order_id AND COALESCE(skip,0)=0 AND COALESCE(warning,"") NOT LIKE "%Existing GnuCash bill/invoice ID found but it is not posted%"');
+
+    $n = 0;
+
+    foreach ($stateMap as $key => $info) {
+        $row = $info['row'] ?? [];
+        $state = $info['state'] ?? [];
+        $vendor = (string)($row['vendor'] ?? '');
+        $orderId = (string)($row['order_id'] ?? '');
+        $skip = (int)($row['skip'] ?? 0);
+
+        if ($vendor === '' || $orderId === '' || empty($state['found'])) {
+            continue;
+        }
+
+        if (!empty($state['posted'])) {
+            if (!$skip) {
+                $markPosted->bindValue(':vendor', $vendor, SQLITE3_TEXT);
+                $markPosted->bindValue(':order_id', $orderId, SQLITE3_TEXT);
+                retry_sqlite_write(fn() => $markPosted->execute());
+                $n++;
+            }
+        } else {
+            // Important: an existing unposted GnuCash bill should not be auto-skipped.
+            // This lets the user restore/re-export a posted bill CSV to update/post it,
+            // while still making the unposted-book state visible on the Review Bills page.
+            if (!$skip) {
+                $warnUnposted->bindValue(':vendor', $vendor, SQLITE3_TEXT);
+                $warnUnposted->bindValue(':order_id', $orderId, SQLITE3_TEXT);
+                retry_sqlite_write(fn() => $warnUnposted->execute());
+            }
+        }
+    }
+
     return $n;
 }
+
 function rebuild_bill_import_against_gnucash(SQLite3 $db, string $gnucashPath): array {
     $ids = load_existing_bill_ids($gnucashPath);
     if (!$ids) return ['marked'=>0, 'restored'=>0, 'checked'=>0, 'message'=>'No existing posted bill/credit IDs could be read from the selected GnuCash file. Check the GnuCash path/backend before rebuilding.'];
@@ -6794,6 +6901,25 @@ function amazon_stored_value_transaction_sum_for_order(SQLite3 $db, string $orde
     }
     return round($sum, 2);
 }
+function amazon_nonstored_charge_transaction_sum_for_order(SQLite3 $db, string $orderId): float {
+    // Sum actual card/bank charge-side rows from Amazon transaction history.
+    // This lets us distinguish two different Amazon exports:
+    //   1) order total is already the residual card charge, or
+    //   2) order total is the gross grand total while transaction history splits
+    //      card charge + Amazon Points/Gift Card/rewards.
+    $stmt = $db->prepare("SELECT payment_method, amount FROM vendor_payments WHERE vendor='amazon' AND order_id=:order_id AND amount < -0.00001");
+    $stmt->bindValue(':order_id', $orderId, SQLITE3_TEXT);
+    $res = $stmt->execute();
+    $sum = 0.0;
+    while ($r = $res->fetchArray(SQLITE3_ASSOC)) {
+        $method = (string)($r['payment_method'] ?? '');
+        if (!is_stored_value_payment_method($method)) {
+            $sum += abs((float)($r['amount'] ?? 0.0));
+        }
+    }
+    return round($sum, 2);
+}
+
 
 function restore_amazon_prime_young_card_only_for_order(SQLite3 $db, string $orderId): array {
     // v141: Amazon sometimes displays "Prime for Young Adults cash back" on the
@@ -6888,52 +7014,83 @@ function split_amazon_prime_young_adults_cashback_payments(SQLite3 $db): int {
 }
 
 function infer_amazon_missing_stored_value_payments(SQLite3 $db): int {
-    // Some Amazon browser exports show rewards/gift-card payments separately from the
-    // order total.  Those stored-value amounts are payment sources, not merchant discounts.
-    // Prefer the transaction-history stored-value amount whenever it is available, even
-    // when there is also a residual credit-card charge.  This keeps coupons/promotions as
-    // negative bill lines while still making the vendor bill equal card + rewards/gift-card.
-    $sel = $db->prepare("SELECT o.order_id, o.total, o.tax, o.shipping, o.shipping_refund, o.gift, o.payments, o.warning, o.notes,
-               SUM(CASE WHEN i.skip=0 AND i.item_key<>'AMAZON-RECONCILE' THEN COALESCE(i.source_amount, i.quantity*i.unit_price) ELSE 0 END) AS item_sum,
-               COUNT(i.item_key) AS item_count
-        FROM orders o
-        LEFT JOIN order_items i ON i.vendor=o.vendor AND i.order_id=o.order_id
-        WHERE o.vendor='amazon'
-        GROUP BY o.order_id");
-    $upd = $db->prepare('UPDATE orders SET gift=:gift, item_amount=:item_amount, shipping_refund=CASE WHEN :shipping_refund > 0.005 THEN :shipping_refund ELSE shipping_refund END, warning=:warning, notes=:notes WHERE vendor="amazon" AND order_id=:order_id');
+    // Some Amazon exports list a card charge and rewards/gift-card/points rows
+    // separately. The stored-value amount is a payment source, not a merchant
+    // discount or gift-wrap charge.
+    //
+    // v207c: Amazon order-history CSV totals can be either:
+    //   A) residual card charge, with stored value shown separately elsewhere; or
+    //   B) gross grand total, while transaction history has card + points split.
+    // When transaction rows prove case B, normalize orders.total to the actual
+    // card charge so order total + gift/stored-value still equals the vendor bill.
+    $sel = $db->prepare("SELECT o.order_id, o.total, o.tax, o.shipping, o.shipping_refund, o.gift, o.payments, o.warning, o.notes, SUM(CASE WHEN i.skip=0 AND i.item_key<>'AMAZON-RECONCILE' THEN COALESCE(i.source_amount, i.quantity*i.unit_price) ELSE 0 END) AS item_sum, COUNT(i.item_key) AS item_count FROM orders o LEFT JOIN order_items i ON i.vendor=o.vendor AND i.order_id=o.order_id WHERE o.vendor='amazon' GROUP BY o.order_id");
+    $upd = $db->prepare('UPDATE orders SET total=:total, gift=:gift, item_amount=:item_amount, shipping_refund=CASE WHEN :shipping_refund > 0.005 THEN :shipping_refund ELSE shipping_refund END, warning=:warning, notes=:notes WHERE vendor="amazon" AND order_id=:order_id');
     $n = 0;
     $res = $sel->execute();
+
     while ($o = $res->fetchArray(SQLITE3_ASSOC)) {
         $oid = (string)($o['order_id'] ?? '');
-        if ((int)($o['item_count'] ?? 0) < 1) continue;
+        if ($oid === '' || (int)($o['item_count'] ?? 0) < 1) continue;
+
         $payments = strtolower((string)($o['payments'] ?? ''));
-        $hasStoredText = (str_contains($payments, 'gift card') || str_contains($payments, 'rewards point') || str_contains($payments, 'reward points') || str_contains($payments, 'cash back'));
+        $hasStoredText = (
+            str_contains($payments, 'gift card')
+            || str_contains($payments, 'rewards point')
+            || str_contains($payments, 'reward points')
+            || str_contains($payments, 'amazon points')
+            || str_contains($payments, 'visa points')
+            || str_contains($payments, 'cash back')
+            || str_contains($payments, 'points')
+        );
+
         $itemSum = round((float)($o['item_sum'] ?? 0.0), 2);
         $tax = round((float)($o['tax'] ?? 0.0), 2);
         $netShipping = round((float)($o['shipping'] ?? 0.0) - (float)($o['shipping_refund'] ?? 0.0), 2);
-        $cardTotal = round((float)($o['total'] ?? 0.0), 2);
-
+        $reportedTotal = round((float)($o['total'] ?? 0.0), 2);
+        $normalizedTotal = $reportedTotal;
         $txStored = amazon_stored_value_transaction_sum_for_order($db, $oid);
+        $txCard = amazon_nonstored_charge_transaction_sum_for_order($db, $oid);
+        $inferred = 0.0;
+        $targetItemAmount = 0.0;
+        $inferredShippingRefund = 0.0;
+        $normalizationNote = '';
+
         if ($txStored > 0.005) {
-            // Full vendor bill = card charge + stored-value payment.  The merchant-adjusted
-            // item subtotal is that bill less tax and net shipping.  Any difference from the
-            // imported item rows remains a coupon/promotion discount line.
             $inferred = $txStored;
-            $targetItemAmount = round($cardTotal + $inferred - $tax - $netShipping, 2);
+            $txGrand = round($txCard + $txStored, 2);
+
+            if ($txCard > 0.005 && abs($reportedTotal - $txGrand) <= 0.02) {
+                // Order CSV total was the gross grand total. Convert it to the
+                // residual card charge so bill target = total + stored value.
+                $normalizedTotal = $txCard;
+                $normalizationNote = ' Transaction-history split detected: Amazon order export total $' . fmt_money($reportedTotal) . ' matched card $' . fmt_money($txCard) . ' + stored value $' . fmt_money($txStored) . '; staged card total normalized to $' . fmt_money($normalizedTotal) . '.';
+            } elseif ($txCard > 0.005 && abs($reportedTotal - $txCard) <= 0.02) {
+                // Order CSV total was already the residual card charge.
+                $normalizedTotal = $reportedTotal;
+            } elseif ($txCard <= 0.005 && abs($reportedTotal - $txStored) <= 0.02) {
+                // All-points/gift-card order where order export total is gross.
+                $normalizedTotal = 0.0;
+                $normalizationNote = ' Transaction-history stored-value-only payment detected: Amazon order export total $' . fmt_money($reportedTotal) . ' matched stored value $' . fmt_money($txStored) . '; staged card total normalized to $0.00.';
+            } else {
+                // Ambiguous. Keep the existing total, but still record the stored
+                // value amount for review/payment exports.
+                $normalizationNote = ' Amazon transaction-history stored value $' . fmt_money($txStored) . ' did not reconcile cleanly with staged total $' . fmt_money($reportedTotal) . ($txCard > 0.005 ? ' and card rows $' . fmt_money($txCard) : '') . '; staged total was not normalized.';
+            }
+
+            $targetItemAmount = round($normalizedTotal + $inferred - $tax - $netShipping, 2);
             if ($targetItemAmount < 0) $targetItemAmount = 0.0;
         } else {
             // Fallback only for all-stored-value/no-charge orders whose exact stored amount is
             // not present in the transaction export but the order text indicates gift/rewards.
             if (!$hasStoredText) continue;
-            if (abs($cardTotal) >= 0.005) continue;
+            if (abs($reportedTotal) >= 0.005) continue;
             $inferred = round($itemSum + $tax + $netShipping, 2);
             if ($inferred <= 0.005) continue;
             $targetItemAmount = round($inferred - $tax - $netShipping, 2);
             if ($targetItemAmount < 0) $targetItemAmount = 0.0;
         }
 
-        $inferredShippingRefund = 0.0;
-        if ($hasStoredText && abs($cardTotal) < 0.005 && $netShipping > 0.005 && abs($inferred - ($itemSum + $tax)) <= 0.02) {
+        if ($hasStoredText && abs($normalizedTotal) < 0.005 && $netShipping > 0.005 && abs($inferred - ($itemSum + $tax)) <= 0.02) {
             // Amazon sometimes exports Shipping but omits the matching Free Shipping
             // offset on all-rewards/points orders. Preserve both as visible lines.
             $inferredShippingRefund = $netShipping;
@@ -6942,10 +7099,20 @@ function infer_amazon_missing_stored_value_payments(SQLite3 $db): int {
             if ($targetItemAmount < 0) $targetItemAmount = 0.0;
         }
 
+        $currentTotal = round((float)($o['total'] ?? 0.0), 2);
         $currentGift = abs((float)($o['gift'] ?? 0.0));
         $currentItemAmount = round((float)($o['item_amount'] ?? 0.0), 2);
         $currentShippingRefund = round((float)($o['shipping_refund'] ?? 0.0), 2);
-        if ($currentGift > 0.005 && abs($currentGift - $inferred) < 0.01 && abs($currentItemAmount - $targetItemAmount) < 0.01 && ($inferredShippingRefund <= 0.005 || abs($currentShippingRefund - $inferredShippingRefund) < 0.01)) continue;
+
+        if (
+            abs($currentTotal - $normalizedTotal) < 0.01
+            && $currentGift > 0.005
+            && abs($currentGift - $inferred) < 0.01
+            && abs($currentItemAmount - $targetItemAmount) < 0.01
+            && ($inferredShippingRefund <= 0.005 || abs($currentShippingRefund - $inferredShippingRefund) < 0.01)
+        ) {
+            continue;
+        }
 
         $warning = trim((string)($o['warning'] ?? ''));
         if ($txStored > 0.005) {
@@ -6954,11 +7121,20 @@ function infer_amazon_missing_stored_value_payments(SQLite3 $db): int {
             $add = 'Amazon gift-card/rewards payment amount was missing from export; inferred $' . fmt_money($inferred) . ' from item lines + tax + shipping.';
         }
         if ($inferredShippingRefund > 0.005) $add .= ' Free Shipping offset inferred from rewards transaction amount: -$' . fmt_money($inferredShippingRefund) . '.';
+        if ($normalizationNote !== '') $add .= $normalizationNote;
         if (!str_contains($warning, 'gift-card/rewards payment amount')) $warning = trim($warning . ' ' . $add);
+        elseif ($normalizationNote !== '' && !str_contains($warning, 'Transaction-history split detected')) $warning = trim($warning . ' ' . $normalizationNote);
+
         $notes = trim((string)($o['notes'] ?? ''));
-        $acctHint = amazon_text_mentions_prime_young_adults_cashback($payments) ? default_config_value('DEFAULT_PRIME_YOUNG_CASHBACK_ACCOUNT_AMAZON') : default_config_value('DEFAULT_REWARDS_ACCOUNT_AMAZON');
+        $acctHint = amazon_text_mentions_prime_young_adults_cashback($payments)
+            ? default_config_value('DEFAULT_PRIME_YOUNG_CASHBACK_ACCOUNT_AMAZON')
+            : default_config_value('DEFAULT_REWARDS_ACCOUNT_AMAZON');
         $hint = 'Inferred Amazon stored-value payment: $' . fmt_money($inferred) . ' -> ' . $acctHint;
+        if ($normalizationNote !== '') $hint .= $normalizationNote;
         if (!str_contains($notes, 'Inferred Amazon stored-value payment')) $notes = trim($notes . ' ' . $hint);
+        elseif ($normalizationNote !== '' && !str_contains($notes, 'Transaction-history split detected')) $notes = trim($notes . ' ' . $normalizationNote);
+
+        $upd->bindValue(':total', $normalizedTotal, SQLITE3_FLOAT);
         $upd->bindValue(':gift', $inferred, SQLITE3_FLOAT);
         $upd->bindValue(':item_amount', $targetItemAmount, SQLITE3_FLOAT);
         $upd->bindValue(':shipping_refund', $inferredShippingRefund, SQLITE3_FLOAT);
@@ -6968,8 +7144,10 @@ function infer_amazon_missing_stored_value_payments(SQLite3 $db): int {
         $upd->execute();
         $n++;
     }
+
     return $n;
 }
+
 
 
 function create_amazon_refund_credit_memos(SQLite3 $db, array $validAccounts = []): int {
@@ -7908,10 +8086,22 @@ function is_export_or_validation_action(string $action): bool {
 
 function render_action_report_html(?string $message, ?string $error, array $exportLinks = [], string $title = 'Action report', string $id = 'action-report'): string {
     if (($message === null || $message === '') && ($error === null || $error === '') && empty($exportLinks)) return '';
-    $html = '<div class="card ' . ($error ? 'err' : 'msg') . ' action-report" id="' . h($id) . '">';
-    $html .= '<strong>' . h($title) . '</strong>';
-    if ($message !== null && $message !== '') $html .= '<p>' . h($message) . '</p>';
-    if ($error !== null && $error !== '') $html .= '<p>' . h($error) . '</p>';
+
+    $html = '<div class="card action-report" id="' . h($id) . '">';
+    $html .= '<h3>' . h($title) . '</h3>';
+
+    if ($message !== null && $message !== '') {
+        $html .= '<p class="ok">' . h($message) . '</p>';
+    }
+
+    if ($error !== null && $error !== '') {
+        $html .= '<p class="error">' . h($error) . '</p>';
+
+        if (str_contains($error, 'Default-variable configuration warning')) {
+            $html .= '<p><a class="button" href="?mode=config#default-variables">Open Default variables configuration</a></p>';
+        }
+    }
+
     if (!empty($exportLinks)) {
         $html .= '<p><strong>Created export/download file(s):</strong></p><ul>';
         foreach ($exportLinks as $l) {
@@ -7922,17 +8112,21 @@ function render_action_report_html(?string $message, ?string $error, array $expo
             $rows = (string)($l['rows'] ?? '');
             $first = (string)($l['first'] ?? '');
             $last = (string)($l['last'] ?? '');
+
             $html .= '<li><a href="' . h(make_export_link($name)) . '" download>' . h($name) . '</a> — ' . h($batch);
             if ($count !== '') $html .= ', ' . h($count) . ' document/report item(s)';
             if ($rows !== '') $html .= ', ' . h($rows) . ' CSV row(s)';
             if ($first !== '') $html .= ', first included ' . h($first) . ' through last included ' . h($last);
             $html .= '</li>';
         }
-        $html .= '</ul><p class="small">Use these links for the next import/apply step. Right-click/open links or download one file at a time if your browser blocks multiple downloads.</p>';
+        $html .= '</ul>';
+        $html .= '<p class="small">Use these links for the next import/apply step. Right-click/open links or download one file at a time if your browser blocks multiple downloads.</p>';
     }
+
     $html .= '</div>';
     return $html;
 }
+
 
 
 function format_gnucash_post_date($date, string $format): string {
@@ -7982,6 +8176,94 @@ function date_sort_query_part(): string {
     return '&date_sort=' . rawurlencode(normalize_date_sort($dateSort ?? 'desc'));
 }
 
+function default_configuration_validation_issues_for_vendors(array $vendors): array {
+    $vendors = array_values(array_unique(array_filter(array_map(
+        fn($v) => strtolower(trim((string)$v)),
+        $vendors
+    ))));
+
+    if (!$vendors) return [];
+
+    $builtins = default_variable_config_builtin_defaults();
+    $active = default_variable_config_defaults();
+    $overrides = load_user_default_config_overrides();
+
+    $requiredByVendor = [
+        'amazon' => [
+            'DEFAULT_VENDOR_AMAZON',
+            'DEFAULT_PAYMENT_ACCOUNT_AMAZON',
+            'DEFAULT_REWARDS_ACCOUNT_AMAZON',
+            'DEFAULT_AP_ACCOUNT',
+            'DEFAULT_TAX_ACCOUNT',
+            'DEFAULT_SHIPPING_ACCOUNT',
+        ],
+        'costco' => [
+            'DEFAULT_VENDOR_COSTCO',
+            'DEFAULT_STORED_VALUE_ACCOUNT_COSTCO',
+            'DEFAULT_AP_ACCOUNT',
+            'DEFAULT_TAX_ACCOUNT',
+            'DEFAULT_SHIPPING_ACCOUNT',
+        ],
+        'walmart' => [
+            'DEFAULT_VENDOR_WALMART',
+            'DEFAULT_STORED_VALUE_ACCOUNT_WALMART',
+            'DEFAULT_AP_ACCOUNT',
+            'DEFAULT_TAX_ACCOUNT',
+            'DEFAULT_SHIPPING_ACCOUNT',
+        ],
+        'lowes' => [
+            'DEFAULT_VENDOR_LOWES',
+            'DEFAULT_STORED_VALUE_ACCOUNT_LOWES',
+            'DEFAULT_AP_ACCOUNT',
+            'DEFAULT_TAX_ACCOUNT',
+            'DEFAULT_SHIPPING_ACCOUNT',
+        ],
+        'tractor_supply' => [
+            'DEFAULT_VENDOR_TRACTOR_SUPPLY',
+            'DEFAULT_AP_ACCOUNT',
+            'DEFAULT_TAX_ACCOUNT',
+            'DEFAULT_SHIPPING_ACCOUNT',
+        ],
+        'home_depot' => [
+            'DEFAULT_VENDOR_HOME_DEPOT',
+            'DEFAULT_PAYMENT_ACCOUNT_HOME_DEPOT',
+            'DEFAULT_AP_ACCOUNT',
+            'DEFAULT_TAX_ACCOUNT',
+            'DEFAULT_SHIPPING_ACCOUNT',
+        ],
+    ];
+
+    $keys = [];
+    foreach ($vendors as $vendor) {
+        foreach (($requiredByVendor[$vendor] ?? []) as $key) {
+            $keys[$key] = true;
+        }
+    }
+
+    if (!$keys) return [];
+
+    $issues = [];
+    foreach (array_keys($keys) as $key) {
+        $activeValue = trim((string)($active[$key] ?? ''));
+        $builtinValue = trim((string)($builtins[$key] ?? ''));
+        $hasOverride = array_key_exists($key, $overrides);
+
+        if ($activeValue === '') {
+            $issues[] = $key . ' is blank';
+            continue;
+        }
+
+        // The local user_defaults.php file is the user's acknowledgement that the value
+        // was reviewed. If a selected-batch vendor still uses the built-in value without
+        // a user override, warn before export so new installs do not silently use project
+        // defaults or placeholder accounts/vendor IDs.
+        if (!$hasOverride && $builtinValue !== '' && $activeValue === $builtinValue) {
+            $issues[] = $key . ' still uses the built-in default value (' . $activeValue . ')';
+        }
+    }
+
+    return $issues;
+}
 function validate_export_ready(SQLite3 $db, array $accounts, string $gnucashPath, int $limitOrders = 0, int $offsetOrders = 0, bool $postInvoices = false, string $postingAccount = ''): array {
     if (trim($postingAccount) === '') $postingAccount = default_config_value('DEFAULT_AP_ACCOUNT', $db);
     $valid=[]; foreach($accounts as $a) $valid[(string)$a['name']] = true;
@@ -7999,7 +8281,7 @@ function validate_export_ready(SQLite3 $db, array $accounts, string $gnucashPath
     if ($limitOrders > 0) $sql .= ' LIMIT ' . (int)$limitOrders . ' OFFSET ' . max(0, (int)$offsetOrders);
     $res=$db->query($sql);
     while($r=$res->fetchArray(SQLITE3_ASSOC)){
-        $id=(string)$r['order_id']; $vendor=(string)$r['vendor'];
+        $id=(string)$r['order_id']; $vendor=(string)$r['vendor']; $selectedValidationVendors[strtolower(trim($vendor))]=true;
         if (vendor_requires_posted_bill_export($vendor)) $requiresPostedAccount = true;
         $itemRes=$db->query("SELECT * FROM order_items WHERE vendor='".SQLite3::escapeString($vendor)."' AND order_id='".SQLite3::escapeString($id)."' AND skip=0");
         $itemCount=0;
@@ -8033,6 +8315,21 @@ function validate_export_ready(SQLite3 $db, array $accounts, string $gnucashPath
             ];
         }
     }
+    if (!isset($selectedValidationVendors) || !is_array($selectedValidationVendors)) {
+        $selectedValidationVendors = [];
+    }
+    $defaultConfigIssues = default_configuration_validation_issues_for_vendors(array_keys($selectedValidationVendors));
+    if ($defaultConfigIssues) {
+        $msg = 'Default-variable configuration warning: selected batch uses vendor/account defaults that need review before export. ' . implode('; ', $defaultConfigIssues) . '. Open the Default variables configuration before importing or exporting bills, then re-run validation.';
+        $errors[] = $msg;
+        $invalid['(default configuration)'][] = [
+            'vendor'=>'system',
+            'order_id'=>'',
+            'type'=>'default_configuration',
+            'label'=>$msg,
+        ];
+    }
+
     if ($requiresPostedAccount) {
         $check($postingAccount, ['vendor'=>'system','order_id'=>'','type'=>'posted_account','label'=>'posted bill Accounts Payable account: ' . $postingAccount]);
     }
@@ -8102,7 +8399,7 @@ function skipped_orders_preview(SQLite3 $db, int $limit = 75): array {
 }
 
 function unskip_selected_orders(SQLite3 $db, array $orders): int {
-    $stmt = $db->prepare('UPDATE orders SET skip=0, warning=trim(REPLACE(COALESCE(warning,""), "Existing bill/invoice ID found in GnuCash; marked skip to avoid duplicate import.", "")) WHERE vendor=:vendor AND order_id=:order_id');
+    $stmt = $db->prepare('UPDATE orders SET skip=0, warning=trim(REPLACE(REPLACE(COALESCE(warning,""), "Existing bill/invoice ID found in GnuCash; marked skip to avoid duplicate import.", ""), "Existing posted bill/invoice ID found in GnuCash; marked skip to avoid duplicate import.", "")) WHERE vendor=:vendor AND order_id=:order_id');
     $n = 0;
     foreach ($orders as $key) {
         $parts = explode('|', (string)$key, 2);
@@ -10196,7 +10493,7 @@ CMD;
 <?php endif; ?>
 <form method="get" style="display:grid; grid-template-columns: 1fr 10rem 8rem 9rem 13rem auto; gap:.5rem; align-items:end; margin-bottom:1rem"><input type="hidden" name="gnucash_path" value="<?=h($gnucashPath)?>"><input type="hidden" name="mode" value="bills"><label>Search/order/item/key<input type="text" name="search" value="<?=h($search)?>"></label><label>Filter<select name="filter"><option value="all" <?= $filter==='all'?'selected':'' ?>>All staged</option><option value="exportable" <?= $filter==='exportable'?'selected':'' ?>>Exportable / non-skipped</option><option value="skipped" <?= $filter==='skipped'?'selected':'' ?>>Skipped</option><option value="warnings" <?= $filter==='warnings'?'selected':'' ?>>Warnings</option><option value="zero_price" <?= $filter==='zero_price'?'selected':'' ?>>Zero-price lines</option><option value="multi_item" <?= $filter==='multi_item'?'selected':'' ?>>Multi-item orders</option></select></label><label>Per page<input type="number" name="per_page" value="<?=h((string)$perPage)?>" min="5" max="100"></label><label>Date sort<select name="date_sort"><option value="desc" <?=$dateSort==='desc'?'selected':''?>>Newest first</option><option value="asc" <?=$dateSort==='asc'?'selected':''?>>Oldest first</option></select></label><label><input type="checkbox" name="show_skipped" value="1" <?=$showSkippedInAll?'checked':''?>> Show skipped in All</label><button type="submit">Apply</button></form>
 <p><strong>Displaying <?=$displayStart?>-<?=$displayEnd?> of <?=$totalFiltered?> orders</strong> &nbsp; <a href="?gnucash_path=<?=urlencode((string)$gnucashPath)?>&search=<?=urlencode($search)?>&filter=<?=urlencode($filter)?>&show_skipped=<?=($showSkippedInAll?'1':'0')?>&date_sort=<?=urlencode($dateSort)?>&per_page=<?=$perPage?>&page=<?=max(1,$page-1)?>#review-top">Previous</a> | <a href="?gnucash_path=<?=urlencode((string)$gnucashPath)?>&search=<?=urlencode($search)?>&filter=<?=urlencode($filter)?>&show_skipped=<?=($showSkippedInAll?'1':'0')?>&date_sort=<?=urlencode($dateSort)?>&per_page=<?=$perPage?>&page=<?=min($totalPages,$page+1)?>#review-top">Next</a><?php if($filter==='skipped'): ?> | <a class="wizard-step" href="?mode=bills&gnucash_path=<?=urlencode((string)$gnucashPath)?>&vendor_hint=<?=urlencode($vendorHint)?>&filter=exportable&show_skipped=0&date_sort=<?=urlencode($dateSort)?>&per_page=<?=$perPage?>#review-top">Exit skipped-orders review</a><?php endif; ?></p>
-<div class="card export-controls" id="export-controls" style="background:#fbfbfb; margin:.5rem 0 1rem 0"><strong>Batch export</strong><div class="small">For GnuCash import, select <em>Comma separated with quotes</em>. Batch export includes only non-skipped/exportable invoices. Optional posting fills date_posted/due_date/account_posted so bills are posted during import; leave off for manual review. Tractor Supply rows are posted automatically because unposted TSC bills otherwise look missing in GnuCash. Your current working set has <?=$stagedOrderCount?> staged invoices, <?=$skippedOrderCount?> skipped, and <?=$exportableOrderCount?> exportable.</div>
+<div class="card export-controls" id="export-controls" style="background:#fbfbfb; margin:.5rem 0 1rem 0"><strong>Batch export</strong><div class="small">For GnuCash import, select <em>Comma separated with quotes</em>. Batch export includes only non-skipped/exportable invoices. Optional posting fills date_posted/due_date/account_posted so bills are posted during import; leave off for manual review. Amazon and Tractor Supply rows are posted automatically because unposted vendor bills otherwise look missing in GnuCash. Your current working set has <?=$stagedOrderCount?> staged invoices, <?=$skippedOrderCount?> skipped, and <?=$exportableOrderCount?> exportable.</div>
 <form method="post" style="display:grid; grid-template-columns: auto auto 9rem 9rem 13rem 11rem 12rem 18rem 1fr; gap:.5rem; align-items:end; margin-top:.5rem">
   <input type="hidden" name="gnucash_path" value="<?=h($gnucashPath)?>">
   <button type="submit" name="action" value="validate_export">Validate selected batch</button>
