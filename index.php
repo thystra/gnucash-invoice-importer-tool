@@ -35,7 +35,7 @@ const DEFAULT_LOWES_PAYMENT_MATCH_DATE_WINDOW_DAYS = '14';
 const DEFAULT_LOWES_PARTIAL_RETURN_MANUAL_STAGE_MIN_AMOUNT = '100.00';
 const DEFAULT_AP_ACCOUNT = 'Liabilities:Accounts Payable';
 
-// Donation/support banner settings.
+// Tip/support banner settings.
 // Set GNUCASH_TOOL_SHOW_DONATION_BANNER=0 to hide.
 // Set GNUCASH_TOOL_DONATION_URL to override the default support link.
 $donationUrl = getenv('GNUCASH_TOOL_DONATION_URL') ?: 'https://ko-fi.com/thewolfandtheraven';
@@ -234,7 +234,7 @@ function render_donation_banner(string $donationUrl, bool $showDonationBanner): 
 <div class="donation-card">
   <div>
     <strong>GnuCash Vendor Import Tool is free and open source.</strong>
-    <span>If this project saves you time, optional donations help fund continued maintenance and new vendor modules.</span>
+    <span>If this project saves you time, optional tips help fund continued maintenance and new vendor modules.</span>
   </div>
   <a href="{$safeUrl}" target="_blank" rel="noopener noreferrer">Support development</a>
 </div>
