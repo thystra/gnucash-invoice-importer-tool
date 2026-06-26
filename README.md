@@ -19,7 +19,7 @@ If this project saves you time, helps clean up your books, or supports your smal
 
 Support development: https://ko-fi.com/thewolfandtheraven
 
-Donations are appreciated but never required.
+Tips are appreciated but never required.
 
 # Usage
 This tool uses the output of several plugins to extract order data from Amazon, Costco, and Walmart. The tool uses a web browswer to parse order history from Lowes and Tractor Supply. Then, the tool ingests these and allows you to categorize the transactions before exporting a CSV that can be imported into GNUCash. The tool also has the ability to match payment transactions automatically to these transactions, by operating directly against your file. 
