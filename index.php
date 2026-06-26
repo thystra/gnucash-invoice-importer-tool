@@ -9,7 +9,7 @@
 
 declare(strict_types=1);
 
-const APP_VERSION = 'v207f';
+const APP_VERSION = 'v207h';
 const APP_DB = __DIR__ . '/data/review.sqlite';
 const DEFAULT_VENDOR_AMAZON = '000005';
 const DEFAULT_VENDOR_COSTCO = '000001';
@@ -1246,7 +1246,7 @@ function connect_app_db(): SQLite3 {
     $colRes = $db->query('PRAGMA table_info(orders)');
     while ($c = $colRes->fetchArray(SQLITE3_ASSOC)) $existingOrderCols[$c['name']] = true;
     if (!isset($existingOrderCols['match_reason'])) $db->exec('ALTER TABLE orders ADD COLUMN match_reason TEXT');
-    if (!isset($existingOrderCols['locked'])) $db->exec('ALTER TABLE orders ADD COLUMN locked INTEGER DEFAULT 0');
+    if (!isset($existingOrderCols['locked'])) $db->exec('ALTER TABLE orders ADD COLUMN locked INTEGER DEFAULT 0'); if (!isset($existingOrderCols['post_only_invoice'])) $db->exec('ALTER TABLE orders ADD COLUMN post_only_invoice INTEGER DEFAULT 0');
     $db->exec('CREATE TABLE IF NOT EXISTS account_rules (
         vendor TEXT NOT NULL,
         match_type TEXT NOT NULL,
@@ -5009,12 +5009,21 @@ function export_gnucash_bill_csv_for_targets(SQLite3 $db, string $outPath, array
         $vcfg = vendor_config($vendor); $vendor_id = $vcfg['vendor_id']; $date = $r['order_date']; $id = canonical_order_id_for_export($vendor, $orderIdRaw);
         $exportDate = format_gnucash_post_date($date, $postDateFormat);
         $billing = strtoupper((string)$vendor) . ' ' . $id; $notes = trim((string)$r['notes']);
-        $rowPostInvoices = $postInvoices || vendor_requires_posted_bill_export($vendor);
+        $rowPostInvoices = $postInvoices || vendor_requires_posted_bill_export($vendor) || ((int)($r['post_only_invoice'] ?? 0) === 1);
         $datePosted = $rowPostInvoices ? $exportDate : '';
         $dueDate = $rowPostInvoices ? $exportDate : '';
         $acctPosted = $rowPostInvoices ? export_account_name($postingAccount, $accountPrefix) : '';
         $memoPosted = $rowPostInvoices ? ('Imported vendor bill ' . $billing) : '';
-        $itemRes = $db->query("SELECT * FROM order_items WHERE vendor='" . SQLite3::escapeString($vendor) . "' AND order_id='" . SQLite3::escapeString($orderIdRaw) . "' AND skip=0 ORDER BY description");
+        if ((int)($r['post_only_invoice'] ?? 0) === 1) {
+            if ($datePosted === '') $datePosted = $exportDate;
+            if ($dueDate === '') $dueDate = $exportDate;
+            if ($acctPosted === '') $acctPosted = export_account_name($postingAccount, $accountPrefix);
+            if ($memoPosted === '') $memoPosted = 'Post existing vendor bill ' . $billing;
+            // Post-only invoice export row: intentionally suppress all bill line items and amounts.
+            fputcsv($fh, [$id,$exportDate,$vendor_id,$billing,$notes,'','','','','','','','','','N','N','',$datePosted,$dueDate,$acctPosted,$memoPosted,'N']);
+            $n++;
+            continue;
+        } $itemRes = $db->query("SELECT * FROM order_items WHERE vendor='" . SQLite3::escapeString($vendor) . "' AND order_id='" . SQLite3::escapeString($orderIdRaw) . "' AND skip=0 ORDER BY description");
         $itemCount = 0;
         while ($it = $itemRes->fetchArray(SQLITE3_ASSOC)) {
             $qty = (float)$it['quantity']; if (abs($qty) < 0.0001) $qty = 1.0; $price = (float)$it['unit_price'];
@@ -7985,10 +7994,11 @@ function save_review_edits(SQLite3 $db, array $post): void {
             $db->exec('BEGIN IMMEDIATE');
             foreach ($post['order'] ?? [] as $key => $data) {
                     [$vendor, $order_id] = explode('|', $key, 2);
-                    $stmt = $db->prepare('UPDATE orders SET expense_account=:expense, item_amount=:item_amount, tax_account=:tax_account, shipping_account=:shipping_account, skip=:skip, locked=:locked, notes=:notes WHERE vendor=:vendor AND order_id=:order_id');
+                    $stmt = $db->prepare('UPDATE orders SET expense_account=:expense, item_amount=:item_amount, tax_account=:tax_account, shipping_account=:shipping_account, skip=:skip, locked=:locked, post_only_invoice=:post_only_invoice, notes=:notes WHERE vendor=:vendor AND order_id=:order_id');
                     $stmt->bindValue(':expense', $data['expense_account'] ?? '', SQLITE3_TEXT); $stmt->bindValue(':item_amount', money_to_float($data['item_amount'] ?? '0'), SQLITE3_FLOAT);
                     $stmt->bindValue(':tax_account', $data['tax_account'] ?? default_config_value('DEFAULT_TAX_ACCOUNT'), SQLITE3_TEXT); $stmt->bindValue(':shipping_account', $data['shipping_account'] ?? default_config_value('DEFAULT_SHIPPING_ACCOUNT'), SQLITE3_TEXT);
-                    $stmt->bindValue(':skip', isset($data['skip']) ? 1 : 0, SQLITE3_INTEGER); $stmt->bindValue(':locked', isset($data['locked']) ? 1 : 0, SQLITE3_INTEGER); $stmt->bindValue(':notes', $data['notes'] ?? '', SQLITE3_TEXT);
+                    $stmt->bindValue(':skip', isset($data['skip']) ? 1 : 0, SQLITE3_INTEGER); $stmt->bindValue(':locked', isset($data['locked']) ? 1 : 0, SQLITE3_INTEGER);
+                $stmt->bindValue(':post_only_invoice', isset($data['post_only_invoice']) ? 1 : 0, SQLITE3_INTEGER); $stmt->bindValue(':notes', $data['notes'] ?? '', SQLITE3_TEXT);
                     $stmt->bindValue(':vendor', $vendor, SQLITE3_TEXT); $stmt->bindValue(':order_id', $order_id, SQLITE3_TEXT); $stmt->execute();
                 }
                 foreach ($post['item'] ?? [] as $key => $data) {
@@ -8282,7 +8292,7 @@ function validate_export_ready(SQLite3 $db, array $accounts, string $gnucashPath
     $res=$db->query($sql);
     while($r=$res->fetchArray(SQLITE3_ASSOC)){
         $id=(string)$r['order_id']; $vendor=(string)$r['vendor']; $selectedValidationVendors[strtolower(trim($vendor))]=true;
-        if (vendor_requires_posted_bill_export($vendor)) $requiresPostedAccount = true;
+        if (vendor_requires_posted_bill_export($vendor)) $requiresPostedAccount = true; if ((int)($r['post_only_invoice'] ?? 0) === 1) { $requiresPostedAccount = true; continue; }
         $itemRes=$db->query("SELECT * FROM order_items WHERE vendor='".SQLite3::escapeString($vendor)."' AND order_id='".SQLite3::escapeString($id)."' AND skip=0");
         $itemCount=0;
         while($it=$itemRes->fetchArray(SQLITE3_ASSOC)){
@@ -10531,6 +10541,7 @@ CMD;
     <div class="orderhead">
       <label><input type="checkbox" name="order[<?=h($okey)?>][skip]" <?=((int)$r['skip']?'checked':'')?>> Skip</label>
       <label><input type="checkbox" name="order[<?=h($okey)?>][locked]" <?=((int)($r['locked'] ?? 0)?'checked':'')?>> Lock invoice</label>
+<label title="Experimental: export only invoice-level posting fields, without line items or amounts. Use only to test posting an existing unposted GnuCash bill."><input type="checkbox" name="order[<?=h($orderKey)?>][post_only_invoice]" <?=((int)($r['post_only_invoice'] ?? 0) ? 'checked' : '')?>> Post only invoice</label>
       <button type="submit" name="save_order" value="<?=h($okey)?>" data-anchor="#<?=h(anchor_id('order', (string)$r['vendor'], (string)$r['order_id']))?>" title="Save review edits and stay near this invoice">Save this invoice</button>
       <div class="invoice-actions">
         <label><span class="small">Set all item categories on this invoice</span><br><input list="accounts" type="text" name="order[<?=h($okey)?>][bulk_expense_account]" placeholder="Expenses:..."></label>
