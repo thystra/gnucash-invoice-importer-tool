@@ -9,7 +9,7 @@
 
 declare(strict_types=1);
 
-const APP_VERSION = 'v207j';
+const APP_VERSION = 'v207k';
 const APP_DB = __DIR__ . '/data/review.sqlite';
 const DEFAULT_VENDOR_AMAZON = '000005';
 const DEFAULT_VENDOR_COSTCO = '000001';
@@ -8296,6 +8296,49 @@ function default_configuration_validation_issues_for_vendors(array $vendors): ar
 
     return $issues;
 }
+function apply_post_only_states_from_request(SQLite3 $db, array $request): int {
+    $states = (array)($request['post_only_state'] ?? []);
+
+    if (!$states) {
+        return 0;
+    }
+
+    $changed = 0;
+    $stmt = $db->prepare('UPDATE orders SET post_only_invoice=:enabled WHERE vendor=:vendor AND order_id=:order_id');
+
+    foreach ($states as $key => $value) {
+        $key = (string)$key;
+        $parts = explode('|', $key, 2);
+
+        if (count($parts) !== 2) {
+            continue;
+        }
+
+        $vendor = strtolower(trim((string)$parts[0]));
+        $orderId = trim((string)$parts[1]);
+
+        if ($vendor === '' || $orderId === '') {
+            continue;
+        }
+
+        $enabled = ((string)$value === '1') ? 1 : 0;
+
+        $stmt->bindValue(':enabled', $enabled, SQLITE3_INTEGER);
+        $stmt->bindValue(':vendor', $vendor, SQLITE3_TEXT);
+        $stmt->bindValue(':order_id', $orderId, SQLITE3_TEXT);
+
+        if (function_exists('retry_sqlite_write')) {
+            retry_sqlite_write(fn() => $stmt->execute());
+        } else {
+            $stmt->execute();
+        }
+
+        $changed += max(0, (int)$db->changes());
+    }
+
+    return $changed;
+}
+
 function validate_export_ready(SQLite3 $db, array $accounts, string $gnucashPath, int $limitOrders = 0, int $offsetOrders = 0, bool $postInvoices = false, string $postingAccount = ''): array {
     if (trim($postingAccount) === '') $postingAccount = default_config_value('DEFAULT_AP_ACCOUNT', $db);
     $valid=[]; foreach($accounts as $a) $valid[(string)$a['name']] = true;
@@ -9542,6 +9585,7 @@ if (($request['action'] ?? '') === 'save') {
         }
     }
     if (in_array(($request['action'] ?? ''), ['validate_export','export','export_range'], true)) {
+    apply_post_only_states_from_request($db, $request);
         [$tmpAccounts, $tmpStatus] = load_gnucash_accounts_with_status((string)$gnucashPath);
         $dupes = mark_existing_bills_to_skip($db, (string)$gnucashPath);
         $batchSize = max(1, min(1000, (int)($request['batch_size'] ?? get_config($db, 'export_batch_size', '50'))));
@@ -11089,6 +11133,91 @@ CMD;
       cb.dataset.postOnlySaved = cb.checked ? '1' : '0';
     });
   });
+})();
+</script>
+
+<script>
+(function(){
+  function visiblePostOnlyCheckboxes() {
+    var selectors = [
+      'input[type="checkbox"][name^="order["][name$="[post_only_invoice]"]',
+      'input[type="checkbox"][data-post-only-invoice-autosave]',
+      'input[type="checkbox"][data-post-only-invoice-state]'
+    ];
+
+    var out = [];
+
+    selectors.forEach(function(sel) {
+      document.querySelectorAll(sel).forEach(function(cb) {
+        if (out.indexOf(cb) === -1) out.push(cb);
+      });
+    });
+
+    document.querySelectorAll('label').forEach(function(label) {
+      if ((label.textContent || '').indexOf('Post only invoice') === -1) return;
+      var cb = label.querySelector('input[type="checkbox"]');
+      if (cb && out.indexOf(cb) === -1) out.push(cb);
+    });
+
+    return out;
+  }
+
+  function postOnlyKeyForCheckbox(cb) {
+    var key = (cb.dataset.postOnlyKey || cb.dataset.postonlykey || '').trim();
+    if (key.indexOf('|') !== -1) return key;
+
+    var vendor = (cb.dataset.vendor || '').trim();
+    var orderId = (cb.dataset.orderId || cb.dataset.orderid || '').trim();
+    if (vendor !== '' && orderId !== '') return vendor + '|' + orderId;
+
+    var name = cb.getAttribute('name') || '';
+    var m = name.match(/^order\[([^\]]+\|[^\]]+)\]\[post_only_invoice\]$/);
+    if (m) return m[1];
+
+    if (cb.value && cb.value.indexOf('|') !== -1) return cb.value;
+
+    var holder = cb.closest('[data-vendor][data-order-id], [data-vendor][data-orderid], [data-post-only-key], [data-postonlykey]');
+    if (holder) {
+      key = (holder.dataset.postOnlyKey || holder.dataset.postonlykey || '').trim();
+      if (key.indexOf('|') !== -1) return key;
+
+      vendor = (holder.dataset.vendor || '').trim();
+      orderId = (holder.dataset.orderId || holder.dataset.orderid || '').trim();
+      if (vendor !== '' && orderId !== '') return vendor + '|' + orderId;
+    }
+
+    return '';
+  }
+
+  function syncPostOnlyStateFields(form) {
+    form.querySelectorAll('input[data-generated-post-only-state="1"]').forEach(function(el) {
+      el.remove();
+    });
+
+    visiblePostOnlyCheckboxes().forEach(function(cb) {
+      var key = postOnlyKeyForCheckbox(cb);
+      if (key === '') return;
+
+      var hidden = document.createElement('input');
+      hidden.type = 'hidden';
+      hidden.name = 'post_only_state[' + key + ']';
+      hidden.value = cb.checked ? '1' : '0';
+      hidden.setAttribute('data-generated-post-only-state', '1');
+      form.appendChild(hidden);
+    });
+  }
+
+  document.addEventListener('submit', function(ev) {
+    var form = ev.target;
+    if (!form || !form.querySelector) return;
+
+    var actionField = form.querySelector('input[name="action"]');
+    var action = actionField ? actionField.value : '';
+
+    if (['validate_export', 'export', 'export_range'].indexOf(action) === -1) return;
+
+    syncPostOnlyStateFields(form);
+  }, true);
 })();
 </script>
 
