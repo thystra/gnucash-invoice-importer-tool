@@ -9,7 +9,7 @@
 
 declare(strict_types=1);
 
-const APP_VERSION = 'v207k';
+const APP_VERSION = 'v207l';
 const APP_DB = __DIR__ . '/data/review.sqlite';
 const DEFAULT_VENDOR_AMAZON = '000005';
 const DEFAULT_VENDOR_COSTCO = '000001';
@@ -11136,88 +11136,187 @@ CMD;
 })();
 </script>
 
+
+
 <script>
 (function(){
-  function visiblePostOnlyCheckboxes() {
-    var selectors = [
-      'input[type="checkbox"][name^="order["][name$="[post_only_invoice]"]',
-      'input[type="checkbox"][data-post-only-invoice-autosave]',
-      'input[type="checkbox"][data-post-only-invoice-state]'
-    ];
+  var EXPORT_ACTIONS = ['validate_export', 'export', 'export_range'];
 
+  function isVisible(el) {
+    return !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+  }
+
+  function allExportForms() {
     var out = [];
-
-    selectors.forEach(function(sel) {
-      document.querySelectorAll(sel).forEach(function(cb) {
-        if (out.indexOf(cb) === -1) out.push(cb);
-      });
+    document.querySelectorAll('form').forEach(function(form) {
+      var actionField = form.querySelector('input[name="action"]');
+      var action = actionField ? actionField.value : '';
+      if (EXPORT_ACTIONS.indexOf(action) !== -1) out.push(form);
     });
+    return out;
+  }
+
+  function visiblePostOnlyCheckboxes() {
+    var out = [];
 
     document.querySelectorAll('label').forEach(function(label) {
       if ((label.textContent || '').indexOf('Post only invoice') === -1) return;
       var cb = label.querySelector('input[type="checkbox"]');
-      if (cb && out.indexOf(cb) === -1) out.push(cb);
+      if (cb && out.indexOf(cb) === -1 && isVisible(cb)) out.push(cb);
+    });
+
+    [
+      'input[type="checkbox"][name*="post_only"]',
+      'input[type="checkbox"][data-post-only-invoice-autosave]',
+      'input[type="checkbox"][data-post-only-invoice-state]'
+    ].forEach(function(sel) {
+      document.querySelectorAll(sel).forEach(function(cb) {
+        if (out.indexOf(cb) === -1 && isVisible(cb)) out.push(cb);
+      });
     });
 
     return out;
   }
 
-  function postOnlyKeyForCheckbox(cb) {
+  function orderCardForCheckbox(cb) {
+    return cb.closest('.card, section, article, form, div') || document.body;
+  }
+
+  function keyFromVisibleContext(cb) {
     var key = (cb.dataset.postOnlyKey || cb.dataset.postonlykey || '').trim();
     if (key.indexOf('|') !== -1) return key;
 
-    var vendor = (cb.dataset.vendor || '').trim();
+    var vendor = (cb.dataset.vendor || '').trim().toLowerCase();
     var orderId = (cb.dataset.orderId || cb.dataset.orderid || '').trim();
     if (vendor !== '' && orderId !== '') return vendor + '|' + orderId;
 
     var name = cb.getAttribute('name') || '';
-    var m = name.match(/^order\[([^\]]+\|[^\]]+)\]\[post_only_invoice\]$/);
+    var m = name.match(/\[([^\]]+\|[^\]]+)\]/);
     if (m) return m[1];
 
     if (cb.value && cb.value.indexOf('|') !== -1) return cb.value;
 
-    var holder = cb.closest('[data-vendor][data-order-id], [data-vendor][data-orderid], [data-post-only-key], [data-postonlykey]');
-    if (holder) {
-      key = (holder.dataset.postOnlyKey || holder.dataset.postonlykey || '').trim();
+    var node = cb.closest('[data-post-only-key], [data-postonlykey], [data-vendor][data-order-id], [data-vendor][data-orderid]');
+    if (node) {
+      key = (node.dataset.postOnlyKey || node.dataset.postonlykey || '').trim();
       if (key.indexOf('|') !== -1) return key;
 
-      vendor = (holder.dataset.vendor || '').trim();
-      orderId = (holder.dataset.orderId || holder.dataset.orderid || '').trim();
+      vendor = (node.dataset.vendor || '').trim().toLowerCase();
+      orderId = (node.dataset.orderId || node.dataset.orderid || '').trim();
       if (vendor !== '' && orderId !== '') return vendor + '|' + orderId;
+    }
+
+    var card = orderCardForCheckbox(cb);
+    var text = (card.textContent || '').replace(/\s+/g, ' ');
+
+    // Amazon order IDs.
+    var amazon = text.match(/\d{3}-\d{7}-\d{7}/);
+    if (amazon) {
+      orderId = amazon[0];
+      vendor = 'amazon';
+      return vendor + '|' + orderId;
+    }
+
+    // TSC in-store/order IDs in staged bill IDs.
+    var tsc = text.match(/TSC-[A-Z0-9-]+|\d{9,}/);
+    if (tsc && /tractor supply|tsc/i.test(text)) {
+      return 'tractor_supply|' + tsc[0];
+    }
+
+    // Lowe's and other vendors generally have an explicit vendor word near the card.
+    var genericOrder = text.match(/\d{6,}[-A-Z0-9]*/);
+    if (genericOrder) {
+      orderId = genericOrder[0];
+      if (/lowe/i.test(text)) vendor = 'lowes';
+      else if (/costco/i.test(text)) vendor = 'costco';
+      else if (/walmart/i.test(text)) vendor = 'walmart';
+      else if (/home depot/i.test(text)) vendor = 'home_depot';
+      if (vendor !== '') return vendor + '|' + orderId;
     }
 
     return '';
   }
 
-  function syncPostOnlyStateFields(form) {
+  function collectPostOnlyStates() {
+    var states = {};
+    visiblePostOnlyCheckboxes().forEach(function(cb) {
+      var key = keyFromVisibleContext(cb);
+      if (key === '') {
+        console.warn('Could not determine vendor/order key for Post only invoice checkbox', cb);
+        return;
+      }
+      states[key] = cb.checked ? '1' : '0';
+    });
+    return states;
+  }
+
+  function syncStatesToExportForm(form) {
     form.querySelectorAll('input[data-generated-post-only-state="1"]').forEach(function(el) {
       el.remove();
     });
 
-    visiblePostOnlyCheckboxes().forEach(function(cb) {
-      var key = postOnlyKeyForCheckbox(cb);
-      if (key === '') return;
-
+    var states = collectPostOnlyStates();
+    Object.keys(states).forEach(function(key) {
       var hidden = document.createElement('input');
       hidden.type = 'hidden';
       hidden.name = 'post_only_state[' + key + ']';
-      hidden.value = cb.checked ? '1' : '0';
+      hidden.value = states[key];
       hidden.setAttribute('data-generated-post-only-state', '1');
       form.appendChild(hidden);
     });
   }
 
+  function syncAllExportForms() {
+    allExportForms().forEach(syncStatesToExportForm);
+  }
+
+  document.addEventListener('change', function(ev) {
+    var cb = ev.target;
+    if (!cb || cb.type !== 'checkbox') return;
+
+    var isPostOnly =
+      (cb.name || '').indexOf('post_only') !== -1 ||
+      cb.hasAttribute('data-post-only-invoice-autosave') ||
+      cb.hasAttribute('data-post-only-invoice-state') ||
+      (cb.closest('label') && (cb.closest('label').textContent || '').indexOf('Post only invoice') !== -1);
+
+    if (!isPostOnly) return;
+    syncAllExportForms();
+  }, true);
+
+  document.addEventListener('click', function(ev) {
+    var btn = ev.target && ev.target.closest ? ev.target.closest('button, input[type="submit"]') : null;
+    if (!btn) return;
+    var form = btn.form || btn.closest('form');
+    if (!form) return;
+    var actionField = form.querySelector('input[name="action"]');
+    var action = actionField ? actionField.value : '';
+    if (EXPORT_ACTIONS.indexOf(action) === -1) return;
+
+    window.__gnucashToolIntentionalExportSubmit = true;
+    syncStatesToExportForm(form);
+  }, true);
+
   document.addEventListener('submit', function(ev) {
     var form = ev.target;
     if (!form || !form.querySelector) return;
-
     var actionField = form.querySelector('input[name="action"]');
     var action = actionField ? actionField.value : '';
+    if (EXPORT_ACTIONS.indexOf(action) === -1) return;
 
-    if (['validate_export', 'export', 'export_range'].indexOf(action) === -1) return;
-
-    syncPostOnlyStateFields(form);
+    window.__gnucashToolIntentionalExportSubmit = true;
+    syncStatesToExportForm(form);
   }, true);
+
+  // Suppress the native unsaved-changes prompt for intentional validate/export submissions.
+  window.addEventListener('beforeunload', function(ev) {
+    if (!window.__gnucashToolIntentionalExportSubmit) return;
+    ev.stopImmediatePropagation();
+    delete ev.returnValue;
+    return undefined;
+  }, true);
+
+  document.addEventListener('DOMContentLoaded', syncAllExportForms);
 })();
 </script>
 
