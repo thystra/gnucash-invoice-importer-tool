@@ -9,7 +9,7 @@
 
 declare(strict_types=1);
 
-const APP_VERSION = 'v207l';
+const APP_VERSION = 'v207m';
 const APP_DB = __DIR__ . '/data/review.sqlite';
 const DEFAULT_VENDOR_AMAZON = '000005';
 const DEFAULT_VENDOR_COSTCO = '000001';
@@ -11309,6 +11309,247 @@ CMD;
   }, true);
 
   // Suppress the native unsaved-changes prompt for intentional validate/export submissions.
+  window.addEventListener('beforeunload', function(ev) {
+    if (!window.__gnucashToolIntentionalExportSubmit) return;
+    ev.stopImmediatePropagation();
+    delete ev.returnValue;
+    return undefined;
+  }, true);
+
+  document.addEventListener('DOMContentLoaded', syncAllExportForms);
+})();
+</script>
+
+<script id="v207m-post-only-submit-keyfix">
+(function(){
+  var EXPORT_ACTIONS = ['validate_export', 'export', 'export_range'];
+
+  function formAction(form) {
+    var field = form && form.querySelector ? form.querySelector('input[name="action"]') : null;
+    return field ? field.value : '';
+  }
+
+  function exportForms() {
+    var forms = [];
+    document.querySelectorAll('form').forEach(function(form) {
+      if (EXPORT_ACTIONS.indexOf(formAction(form)) !== -1) forms.push(form);
+    });
+    return forms;
+  }
+
+  function isVisible(el) {
+    return !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+  }
+
+  function postOnlyCheckboxes() {
+    var out = [];
+
+    document.querySelectorAll('label').forEach(function(label) {
+      if ((label.textContent || '').indexOf('Post only invoice') === -1) return;
+      var cb = label.querySelector('input[type="checkbox"]');
+      if (cb && out.indexOf(cb) === -1 && isVisible(cb)) out.push(cb);
+    });
+
+    [
+      'input[type="checkbox"][name*="post_only"]',
+      'input[type="checkbox"][data-post-only-invoice-autosave]',
+      'input[type="checkbox"][data-post-only-invoice-state]',
+      'input[type="checkbox"][data-post-only-key]'
+    ].forEach(function(sel) {
+      document.querySelectorAll(sel).forEach(function(cb) {
+        if (out.indexOf(cb) === -1 && isVisible(cb)) out.push(cb);
+      });
+    });
+
+    return out;
+  }
+
+  function orderKeyFromText(text) {
+    text = (text || '').replace(/\s+/g, ' ');
+
+    var m = text.match(/\b(\d{3}-\d{7}-\d{7})\b/);
+    if (m) return 'amazon|' + m[1];
+
+    m = text.match(/\b(TSC-[A-Z0-9-]+)\b/i);
+    if (m) return 'tractor_supply|' + m[1];
+
+    if (/tractor supply|\btsc\b/i.test(text)) {
+      m = text.match(/\b(\d{9,})\b/);
+      if (m) return 'tractor_supply|' + m[1];
+    }
+
+    if (/lowe/i.test(text)) {
+      m = text.match(/\b(\d{6,}[-A-Z0-9]*)\b/);
+      if (m) return 'lowes|' + m[1];
+    }
+
+    if (/costco/i.test(text)) {
+      m = text.match(/\b(\d{6,}[-A-Z0-9]*)\b/);
+      if (m) return 'costco|' + m[1];
+    }
+
+    if (/walmart/i.test(text)) {
+      m = text.match(/\b(\d{6,}[-A-Z0-9]*)\b/);
+      if (m) return 'walmart|' + m[1];
+    }
+
+    if (/home depot/i.test(text)) {
+      m = text.match(/\b(\d{6,}[-A-Z0-9]*)\b/);
+      if (m) return 'home_depot|' + m[1];
+    }
+
+    return '';
+  }
+
+  function postOnlyKey(cb) {
+    var key = (cb.dataset.postOnlyKey || cb.dataset.postonlykey || '').trim();
+    if (key.indexOf('|') !== -1) return key;
+
+    var vendor = (cb.dataset.vendor || '').trim().toLowerCase();
+    var orderId = (cb.dataset.orderId || cb.dataset.orderid || '').trim();
+    if (vendor !== '' && orderId !== '') return vendor + '|' + orderId;
+
+    var name = cb.getAttribute('name') || '';
+    var n = name.match(/\[([^\]]+\|[^\]]+)\]/);
+    if (n) return n[1];
+
+    if (cb.value && cb.value.indexOf('|') !== -1) return cb.value;
+
+    // Walk up the DOM until we find a nearby container that includes an order ID.
+    var node = cb;
+    var best = '';
+    for (var depth = 0; node && node !== document.body && depth < 12; depth++, node = node.parentElement) {
+      if (node.dataset) {
+        key = (node.dataset.postOnlyKey || node.dataset.postonlykey || '').trim();
+        if (key.indexOf('|') !== -1) return key;
+
+        vendor = (node.dataset.vendor || '').trim().toLowerCase();
+        orderId = (node.dataset.orderId || node.dataset.orderid || '').trim();
+        if (vendor !== '' && orderId !== '') return vendor + '|' + orderId;
+      }
+
+      var text = node.textContent || '';
+      key = orderKeyFromText(text);
+      if (key !== '') {
+        best = key;
+        // Prefer a small-ish ancestor so body/global text cannot grab the wrong order.
+        if (text.length < 6000) return key;
+      }
+    }
+
+    if (best !== '') return best;
+
+    // Last resort for single-order filtered pages.
+    var bodyKey = orderKeyFromText(document.body ? document.body.textContent : '');
+    return bodyKey;
+  }
+
+  function currentStates() {
+    var states = {};
+    postOnlyCheckboxes().forEach(function(cb) {
+      var key = postOnlyKey(cb);
+      if (key === '') {
+        console.warn('Post-only invoice checkbox has no vendor/order key', cb);
+        return;
+      }
+      states[key] = cb.checked ? '1' : '0';
+    });
+    return states;
+  }
+
+  function syncStatesToForm(form) {
+    form.querySelectorAll('input[data-v207m-post-only-state="1"]').forEach(function(el) {
+      el.remove();
+    });
+
+    var states = currentStates();
+    Object.keys(states).forEach(function(key) {
+      var hidden = document.createElement('input');
+      hidden.type = 'hidden';
+      hidden.name = 'post_only_state[' + key + ']';
+      hidden.value = states[key];
+      hidden.setAttribute('data-v207m-post-only-state', '1');
+      form.appendChild(hidden);
+    });
+
+    if (Object.keys(states).length === 0) {
+      console.warn('No visible Post-only invoice checkboxes were found to sync.');
+    }
+  }
+
+  function syncAllExportForms() {
+    exportForms().forEach(syncStatesToForm);
+  }
+
+  function ajaxSaveCheckbox(cb) {
+    var key = postOnlyKey(cb);
+    if (key === '' || key.indexOf('|') === -1) return;
+
+    var parts = key.split('|');
+    var vendor = parts.shift();
+    var orderId = parts.join('|');
+
+    var fd = new FormData();
+    fd.set('action', 'set_post_only_invoice');
+    fd.set('ajax', '1');
+    fd.set('mode', 'bills');
+    fd.set('vendor', vendor);
+    fd.set('order_id', orderId);
+    fd.set('enabled', cb.checked ? '1' : '0');
+
+    fetch(window.location.pathname + window.location.search, {
+      method: 'POST',
+      credentials: 'same-origin',
+      body: fd
+    }).then(function(resp) {
+      if (!resp.ok) throw new Error('HTTP ' + resp.status);
+      return resp.json();
+    }).then(function(data) {
+      if (!data || !data.ok) throw new Error((data && data.error) ? data.error : 'save failed');
+      cb.dataset.postOnlySaved = cb.checked ? '1' : '0';
+    }).catch(function(err) {
+      console.warn('Post-only autosave failed; Validate/Export submit will still send the state.', err);
+    });
+  }
+
+  document.addEventListener('change', function(ev) {
+    var cb = ev.target;
+    if (!cb || cb.type !== 'checkbox') return;
+
+    var isPostOnly =
+      (cb.name || '').indexOf('post_only') !== -1 ||
+      cb.hasAttribute('data-post-only-key') ||
+      cb.hasAttribute('data-post-only-invoice-autosave') ||
+      cb.hasAttribute('data-post-only-invoice-state') ||
+      (cb.closest('label') && (cb.closest('label').textContent || '').indexOf('Post only invoice') !== -1);
+
+    if (!isPostOnly) return;
+
+    syncAllExportForms();
+    ajaxSaveCheckbox(cb);
+  }, true);
+
+  document.addEventListener('click', function(ev) {
+    var btn = ev.target && ev.target.closest ? ev.target.closest('button, input[type="submit"]') : null;
+    if (!btn) return;
+
+    var form = btn.form || btn.closest('form');
+    if (!form || EXPORT_ACTIONS.indexOf(formAction(form)) === -1) return;
+
+    window.__gnucashToolIntentionalExportSubmit = true;
+    window.onbeforeunload = null;
+    syncStatesToForm(form);
+  }, true);
+
+  document.addEventListener('submit', function(ev) {
+    var form = ev.target;
+    if (!form || EXPORT_ACTIONS.indexOf(formAction(form)) === -1) return;
+
+    window.__gnucashToolIntentionalExportSubmit = true;
+    window.onbeforeunload = null;
+    syncStatesToForm(form);
+  }, true);
+
   window.addEventListener('beforeunload', function(ev) {
     if (!window.__gnucashToolIntentionalExportSubmit) return;
     ev.stopImmediatePropagation();
