@@ -9,7 +9,7 @@
 
 declare(strict_types=1);
 
-const APP_VERSION = 'v207m';
+const APP_VERSION = 'v207n';
 const APP_DB = __DIR__ . '/data/review.sqlite';
 const DEFAULT_VENDOR_AMAZON = '000005';
 const DEFAULT_VENDOR_COSTCO = '000001';
@@ -85,12 +85,6 @@ function invalidate_user_defaults_config_cache(): void {
 function load_user_default_config_overrides(): array {
     $path = user_defaults_config_path();
     invalidate_user_defaults_config_cache();
-
-    if (!is_readable($path)) {
-        return [];
-    }
-
-    $data = require $path;
 
     if (!is_readable($path)) {
         return [];
@@ -1119,13 +1113,20 @@ function vendor_config(string $vendor): array {
 }
 
 function vendor_requires_posted_bill_export(string $vendor): bool {
-    // Amazon and Tractor Supply bill imports should arrive in GnuCash as posted bills.
-    // GnuCash's business UI does not show unposted bill documents in the usual payable
-    // views, which made successful imports look missing. Keep the global Post invoices
-    // checkbox for other vendors, but force posting columns for these vendor rows during
-    // validation and CSV export.
-    return in_array(strtolower(trim($vendor)), ['amazon', 'tractor_supply'], true);
+    // All supported vendor bill imports should arrive in GnuCash as posted bills.
+    // GnuCash's business UI does not show unposted bill documents in the usual
+    // payable views, which made successful imports look missing and prevented
+    // payment application workflows from proceeding.
+    return in_array(strtolower(trim($vendor)), [
+        'amazon',
+        'costco',
+        'walmart',
+        'lowes',
+        'home_depot',
+        'tractor_supply',
+    ], true);
 }
+
 
 
 function normalize_key_text(string $s): string {
@@ -5005,25 +5006,7 @@ function export_gnucash_bill_csv_for_targets(SQLite3 $db, string $outPath, array
     $n = 0;
     while ($r = $res->fetchArray(SQLITE3_ASSOC)) {
         $vendor = (string)$r['vendor']; $orderIdRaw = (string)$r['order_id'];
-        if (!isset($want[$vendor.'|'.$orderIdRaw])) continue;
-        $vcfg = vendor_config($vendor); $vendor_id = $vcfg['vendor_id']; $date = $r['order_date']; $id = canonical_order_id_for_export($vendor, $orderIdRaw);
-        $exportDate = format_gnucash_post_date($date, $postDateFormat);
-        $billing = strtoupper((string)$vendor) . ' ' . $id; $notes = trim((string)$r['notes']);
-        $rowPostInvoices = $postInvoices || vendor_requires_posted_bill_export($vendor) || ((int)($r['post_only_invoice'] ?? 0) === 1);
-        $datePosted = $rowPostInvoices ? $exportDate : '';
-        $dueDate = $rowPostInvoices ? $exportDate : '';
-        $acctPosted = $rowPostInvoices ? export_account_name($postingAccount, $accountPrefix) : '';
-        $memoPosted = $rowPostInvoices ? ('Imported vendor bill ' . $billing) : '';
-        if ((int)($r['post_only_invoice'] ?? 0) === 1) {
-            if ($datePosted === '') $datePosted = $exportDate;
-            if ($dueDate === '') $dueDate = $exportDate;
-            if ($acctPosted === '') $acctPosted = export_account_name($postingAccount, $accountPrefix);
-            if ($memoPosted === '') $memoPosted = 'Post existing vendor bill ' . $billing;
-            // Post-only invoice export row: intentionally suppress all bill line items and amounts.
-            fputcsv($fh, [$id,$exportDate,$vendor_id,$billing,$notes,'','','','','','','','','','N','N','',$datePosted,$dueDate,$acctPosted,$memoPosted,'N']);
-            $n++;
-            continue;
-        } $itemRes = $db->query("SELECT * FROM order_items WHERE vendor='" . SQLite3::escapeString($vendor) . "' AND order_id='" . SQLite3::escapeString($orderIdRaw) . "' AND skip=0 ORDER BY description");
+         $itemRes = $db->query("SELECT * FROM order_items WHERE vendor='" . SQLite3::escapeString($vendor) . "' AND order_id='" . SQLite3::escapeString($orderIdRaw) . "' AND skip=0 ORDER BY description");
         $itemCount = 0;
         while ($it = $itemRes->fetchArray(SQLITE3_ASSOC)) {
             $qty = (float)$it['quantity']; if (abs($qty) < 0.0001) $qty = 1.0; $price = (float)$it['unit_price'];
@@ -7986,28 +7969,6 @@ function set_invoice_items_category(SQLite3 $db, string $vendor, string $order_i
     return [$changed, 'Set the fallback expense category on no-item invoice ' . $order_id . ' to ' . $account . '.'];
 }
 
-function set_order_post_only_invoice(SQLite3 $db, string $vendor, string $orderId, bool $enabled): bool {
-    $vendor = strtolower(trim($vendor));
-    $orderId = trim($orderId);
-
-    if ($vendor === '' || $orderId === '') {
-        return false;
-    }
-
-    $stmt = $db->prepare('UPDATE orders SET post_only_invoice=:enabled WHERE vendor=:vendor AND order_id=:order_id');
-    $stmt->bindValue(':enabled', $enabled ? 1 : 0, SQLITE3_INTEGER);
-    $stmt->bindValue(':vendor', $vendor, SQLITE3_TEXT);
-    $stmt->bindValue(':order_id', $orderId, SQLITE3_TEXT);
-
-    if (function_exists('retry_sqlite_write')) {
-        retry_sqlite_write(fn() => $stmt->execute());
-    } else {
-        $stmt->execute();
-    }
-
-    return $db->changes() > 0;
-}
-
 function save_review_edits(SQLite3 $db, array $post): void {
     $last = null;
     for ($attempt = 1; $attempt <= 5; $attempt++) {
@@ -8016,12 +7977,10 @@ function save_review_edits(SQLite3 $db, array $post): void {
             $db->exec('BEGIN IMMEDIATE');
             foreach ($post['order'] ?? [] as $key => $data) {
                     [$vendor, $order_id] = explode('|', $key, 2);
-                    $stmt = $db->prepare('UPDATE orders SET expense_account=:expense, item_amount=:item_amount, tax_account=:tax_account, shipping_account=:shipping_account, skip=:skip, locked=:locked, post_only_invoice=:post_only_invoice, notes=:notes WHERE vendor=:vendor AND order_id=:order_id');
+                    $stmt = $db->prepare('UPDATE orders SET expense_account=:expense, item_amount=:item_amount, tax_account=:tax_account, shipping_account=:shipping_account, skip=:skip, locked=:locked=:notes=:notes WHERE vendor=:vendor AND order_id=:order_id');
                     $stmt->bindValue(':expense', $data['expense_account'] ?? '', SQLITE3_TEXT); $stmt->bindValue(':item_amount', money_to_float($data['item_amount'] ?? '0'), SQLITE3_FLOAT);
                     $stmt->bindValue(':tax_account', $data['tax_account'] ?? default_config_value('DEFAULT_TAX_ACCOUNT'), SQLITE3_TEXT); $stmt->bindValue(':shipping_account', $data['shipping_account'] ?? default_config_value('DEFAULT_SHIPPING_ACCOUNT'), SQLITE3_TEXT);
-                    $stmt->bindValue(':skip', isset($data['skip']) ? 1 : 0, SQLITE3_INTEGER); $stmt->bindValue(':locked', isset($data['locked']) ? 1 : 0, SQLITE3_INTEGER);
-                $stmt->bindValue(':post_only_invoice', isset($data['post_only_invoice']) ? 1 : 0, SQLITE3_INTEGER); $stmt->bindValue(':notes', $data['notes'] ?? '', SQLITE3_TEXT);
-                    $stmt->bindValue(':vendor', $vendor, SQLITE3_TEXT); $stmt->bindValue(':order_id', $order_id, SQLITE3_TEXT); $stmt->execute();
+                    $stmt->bindValue(':skip', isset($data['skip']) ? 1 : 0, SQLITE3_INTEGER); $stmt->bindValue(':locked', isset($data['locked']) ? 1 : 0, SQLITE3_INTEGER);                    $stmt->bindValue(':vendor', $vendor, SQLITE3_TEXT); $stmt->bindValue(':order_id', $order_id, SQLITE3_TEXT); $stmt->execute();
                 }
                 foreach ($post['item'] ?? [] as $key => $data) {
                     [$vendor, $order_id, $item_key] = explode('|', $key, 3);
@@ -8296,49 +8255,6 @@ function default_configuration_validation_issues_for_vendors(array $vendors): ar
 
     return $issues;
 }
-function apply_post_only_states_from_request(SQLite3 $db, array $request): int {
-    $states = (array)($request['post_only_state'] ?? []);
-
-    if (!$states) {
-        return 0;
-    }
-
-    $changed = 0;
-    $stmt = $db->prepare('UPDATE orders SET post_only_invoice=:enabled WHERE vendor=:vendor AND order_id=:order_id');
-
-    foreach ($states as $key => $value) {
-        $key = (string)$key;
-        $parts = explode('|', $key, 2);
-
-        if (count($parts) !== 2) {
-            continue;
-        }
-
-        $vendor = strtolower(trim((string)$parts[0]));
-        $orderId = trim((string)$parts[1]);
-
-        if ($vendor === '' || $orderId === '') {
-            continue;
-        }
-
-        $enabled = ((string)$value === '1') ? 1 : 0;
-
-        $stmt->bindValue(':enabled', $enabled, SQLITE3_INTEGER);
-        $stmt->bindValue(':vendor', $vendor, SQLITE3_TEXT);
-        $stmt->bindValue(':order_id', $orderId, SQLITE3_TEXT);
-
-        if (function_exists('retry_sqlite_write')) {
-            retry_sqlite_write(fn() => $stmt->execute());
-        } else {
-            $stmt->execute();
-        }
-
-        $changed += max(0, (int)$db->changes());
-    }
-
-    return $changed;
-}
-
 function validate_export_ready(SQLite3 $db, array $accounts, string $gnucashPath, int $limitOrders = 0, int $offsetOrders = 0, bool $postInvoices = false, string $postingAccount = ''): array {
     if (trim($postingAccount) === '') $postingAccount = default_config_value('DEFAULT_AP_ACCOUNT', $db);
     $valid=[]; foreach($accounts as $a) $valid[(string)$a['name']] = true;
@@ -8357,8 +8273,7 @@ function validate_export_ready(SQLite3 $db, array $accounts, string $gnucashPath
     $res=$db->query($sql);
     while($r=$res->fetchArray(SQLITE3_ASSOC)){
         $id=(string)$r['order_id']; $vendor=(string)$r['vendor']; $selectedValidationVendors[strtolower(trim($vendor))]=true;
-        if (vendor_requires_posted_bill_export($vendor)) $requiresPostedAccount = true; if ((int)($r['post_only_invoice'] ?? 0) === 1) { $requiresPostedAccount = true; continue; }
-        $itemRes=$db->query("SELECT * FROM order_items WHERE vendor='".SQLite3::escapeString($vendor)."' AND order_id='".SQLite3::escapeString($id)."' AND skip=0");
+                $itemRes=$db->query("SELECT * FROM order_items WHERE vendor='".SQLite3::escapeString($vendor)."' AND order_id='".SQLite3::escapeString($id)."' AND skip=0");
         $itemCount=0;
         while($it=$itemRes->fetchArray(SQLITE3_ASSOC)){
             $itemCount++;
@@ -8427,21 +8342,12 @@ function export_gnucash_bill_csv(SQLite3 $db, string $outPath, bool $withHeader 
         $exportDate = format_gnucash_post_date($date, $postDateFormat);
         $billing = strtoupper((string)$r['vendor']) . ' ' . $id; $notes = trim((string)$r['notes']);
         $rowVendor = (string)$r['vendor'];
-        $rowPostInvoices = $postInvoices || vendor_requires_posted_bill_export($rowVendor) || ((int)($r['post_only_invoice'] ?? 0) === 1);
+        $rowPostInvoices = $postInvoices || vendor_requires_posted_bill_export($rowVendor);
         $datePosted = $rowPostInvoices ? $exportDate : '';
         $dueDate = $rowPostInvoices ? $exportDate : '';
         $acctPosted = $rowPostInvoices ? export_account_name($postingAccount, $accountPrefix) : '';
         $memoPosted = $rowPostInvoices ? ('Imported vendor bill ' . $billing) : '';
-        if ((int)($r['post_only_invoice'] ?? 0) === 1) {
-            if ($datePosted === '') $datePosted = $exportDate;
-            if ($dueDate === '') $dueDate = $exportDate;
-            if ($acctPosted === '') $acctPosted = export_account_name($postingAccount, $accountPrefix);
-            if ($memoPosted === '') $memoPosted = 'Post existing vendor bill ' . $billing;
-            // Post-only invoice export row: intentionally suppress all bill line items, shipping, tax, and amounts.
-            fputcsv($fh, [$id,$exportDate,$vendor_id,$billing,$notes,'','','','','','','','','','N','N','',$datePosted,$dueDate,$acctPosted,$memoPosted,'N']);
-            $n++;
-            continue;
-        } $itemRes = $db->query("SELECT * FROM order_items WHERE vendor='" . SQLite3::escapeString($r['vendor']) . "' AND order_id='" . SQLite3::escapeString($id) . "' AND skip=0 ORDER BY description");
+         $itemRes = $db->query("SELECT * FROM order_items WHERE vendor='" . SQLite3::escapeString($r['vendor']) . "' AND order_id='" . SQLite3::escapeString($id) . "' AND skip=0 ORDER BY description");
         $itemCount = 0;
         while ($it = $itemRes->fetchArray(SQLITE3_ASSOC)) {
             $qty = (float)$it['quantity']; if (abs($qty) < 0.0001) $qty = 1.0; $price = (float)$it['unit_price'];
@@ -9513,35 +9419,7 @@ if (($request['action'] ?? '') === 'save_default_variables') {
             }
         }
     }
-    if (($request['action'] ?? '') === 'set_post_only_invoice') {
-    $ok = false;
-    $vendor = (string)($request['vendor'] ?? '');
-    $orderId = (string)($request['order_id'] ?? '');
-    $enabled = (string)($request['enabled'] ?? '0') === '1';
-
-    try {
-        $ok = set_order_post_only_invoice($db, $vendor, $orderId, $enabled);
-    } catch (Throwable $e) {
-        if (($request['ajax'] ?? '') === '1') {
-            header('Content-Type: application/json');
-            echo json_encode(['ok' => false, 'error' => $e->getMessage()]);
-            exit;
-        }
-        throw $e;
-    }
-
-    if (($request['ajax'] ?? '') === '1') {
-        header('Content-Type: application/json');
-        echo json_encode(['ok' => $ok, 'vendor' => strtolower(trim($vendor)), 'order_id' => trim($orderId), 'enabled' => $enabled]);
-        exit;
-    }
-
-    $message = $ok ? 'Saved post-only invoice setting.' : 'No matching staged invoice was found for the post-only invoice setting.';
-    $mode = 'bills';
-    set_config($db, 'ui_mode', $mode);
-}
-
-if (($request['action'] ?? '') === 'save') {
+    if (($request['action'] ?? '') === 'save') {
         try {
             save_review_edits($db, $request);
             if (isset($request['save_credit_return_items'])) {
@@ -9585,7 +9463,6 @@ if (($request['action'] ?? '') === 'save') {
         }
     }
     if (in_array(($request['action'] ?? ''), ['validate_export','export','export_range'], true)) {
-    apply_post_only_states_from_request($db, $request);
         [$tmpAccounts, $tmpStatus] = load_gnucash_accounts_with_status((string)$gnucashPath);
         $dupes = mark_existing_bills_to_skip($db, (string)$gnucashPath);
         $batchSize = max(1, min(1000, (int)($request['batch_size'] ?? get_config($db, 'export_batch_size', '50'))));
@@ -10606,7 +10483,7 @@ CMD;
 <?php endif; ?>
 <form method="get" style="display:grid; grid-template-columns: 1fr 10rem 8rem 9rem 13rem auto; gap:.5rem; align-items:end; margin-bottom:1rem"><input type="hidden" name="gnucash_path" value="<?=h($gnucashPath)?>"><input type="hidden" name="mode" value="bills"><label>Search/order/item/key<input type="text" name="search" value="<?=h($search)?>"></label><label>Filter<select name="filter"><option value="all" <?= $filter==='all'?'selected':'' ?>>All staged</option><option value="exportable" <?= $filter==='exportable'?'selected':'' ?>>Exportable / non-skipped</option><option value="skipped" <?= $filter==='skipped'?'selected':'' ?>>Skipped</option><option value="warnings" <?= $filter==='warnings'?'selected':'' ?>>Warnings</option><option value="zero_price" <?= $filter==='zero_price'?'selected':'' ?>>Zero-price lines</option><option value="multi_item" <?= $filter==='multi_item'?'selected':'' ?>>Multi-item orders</option></select></label><label>Per page<input type="number" name="per_page" value="<?=h((string)$perPage)?>" min="5" max="100"></label><label>Date sort<select name="date_sort"><option value="desc" <?=$dateSort==='desc'?'selected':''?>>Newest first</option><option value="asc" <?=$dateSort==='asc'?'selected':''?>>Oldest first</option></select></label><label><input type="checkbox" name="show_skipped" value="1" <?=$showSkippedInAll?'checked':''?>> Show skipped in All</label><button type="submit">Apply</button></form>
 <p><strong>Displaying <?=$displayStart?>-<?=$displayEnd?> of <?=$totalFiltered?> orders</strong> &nbsp; <a href="?gnucash_path=<?=urlencode((string)$gnucashPath)?>&search=<?=urlencode($search)?>&filter=<?=urlencode($filter)?>&show_skipped=<?=($showSkippedInAll?'1':'0')?>&date_sort=<?=urlencode($dateSort)?>&per_page=<?=$perPage?>&page=<?=max(1,$page-1)?>#review-top">Previous</a> | <a href="?gnucash_path=<?=urlencode((string)$gnucashPath)?>&search=<?=urlencode($search)?>&filter=<?=urlencode($filter)?>&show_skipped=<?=($showSkippedInAll?'1':'0')?>&date_sort=<?=urlencode($dateSort)?>&per_page=<?=$perPage?>&page=<?=min($totalPages,$page+1)?>#review-top">Next</a><?php if($filter==='skipped'): ?> | <a class="wizard-step" href="?mode=bills&gnucash_path=<?=urlencode((string)$gnucashPath)?>&vendor_hint=<?=urlencode($vendorHint)?>&filter=exportable&show_skipped=0&date_sort=<?=urlencode($dateSort)?>&per_page=<?=$perPage?>#review-top">Exit skipped-orders review</a><?php endif; ?></p>
-<div class="card export-controls" id="export-controls" style="background:#fbfbfb; margin:.5rem 0 1rem 0"><strong>Batch export</strong><div class="small">For GnuCash import, select <em>Comma separated with quotes</em>. Batch export includes only non-skipped/exportable invoices. Optional posting fills date_posted/due_date/account_posted so bills are posted during import; leave off for manual review. Amazon and Tractor Supply rows are posted automatically because unposted vendor bills otherwise look missing in GnuCash. Your current working set has <?=$stagedOrderCount?> staged invoices, <?=$skippedOrderCount?> skipped, and <?=$exportableOrderCount?> exportable.</div>
+<div class="card export-controls" id="export-controls" style="background:#fbfbfb; margin:.5rem 0 1rem 0"><strong>Batch export</strong><div class="small">For GnuCash import, select <em>Comma separated with quotes</em>. Batch export includes only non-skipped/exportable invoices. Optional posting fills date_posted/due_date/account_posted so bills are posted during import; leave off for manual review. All supported vendor-plugin rows are posted automatically because unposted vendor bills otherwise look missing in GnuCash and cannot be used by payment workflows. Your current working set has <?=$stagedOrderCount?> staged invoices, <?=$skippedOrderCount?> skipped, and <?=$exportableOrderCount?> exportable.</div>
 <form method="post" style="display:grid; grid-template-columns: auto auto 9rem 9rem 13rem 11rem 12rem 18rem 1fr; gap:.5rem; align-items:end; margin-top:.5rem">
   <input type="hidden" name="gnucash_path" value="<?=h($gnucashPath)?>">
   <button type="submit" name="action" value="validate_export">Validate selected batch</button>
@@ -10960,605 +10837,12 @@ CMD;
   });
 })();
 </script>
-<script>
-(function(){
-  function postOnlyInputs() {
-    var out = [];
 
-    document.querySelectorAll('label').forEach(function(label) {
-      if ((label.textContent || '').indexOf('Post only invoice') === -1) return;
-      var cb = label.querySelector('input[type="checkbox"]');
-      if (cb && out.indexOf(cb) === -1) out.push(cb);
-    });
 
-    document.querySelectorAll('input[type="checkbox"][name*="post_only"]').forEach(function(cb) {
-      if (out.indexOf(cb) === -1) out.push(cb);
-    });
 
-    document.querySelectorAll('input[type="checkbox"][data-post-only-invoice-autosave]').forEach(function(cb) {
-      if (out.indexOf(cb) === -1) out.push(cb);
-    });
 
-    return out;
-  }
 
-  function orderIdentityFromInput(cb) {
-    var vendor = (cb.dataset.vendor || '').trim();
-    var orderId = (cb.dataset.orderId || cb.dataset.orderid || '').trim();
 
-    if (vendor !== '' && orderId !== '') {
-      return {vendor: vendor, order_id: orderId};
-    }
 
-    var key = '';
-    var name = cb.getAttribute('name') || '';
-    var m = name.match(/\[([^\]]+)\]/);
-    if (m) key = m[1];
-
-    if (key === '' && cb.value && cb.value.indexOf('|') !== -1) {
-      key = cb.value;
-    }
-
-    if (key.indexOf('|') !== -1) {
-      var parts = key.split('|');
-      vendor = (parts.shift() || '').trim();
-      orderId = parts.join('|').trim();
-      if (vendor !== '' && orderId !== '') {
-        return {vendor: vendor, order_id: orderId};
-      }
-    }
-
-    var holder = cb.closest('[data-vendor][data-order-id], [data-vendor][data-orderid]');
-    if (holder) {
-      vendor = (holder.dataset.vendor || '').trim();
-      orderId = (holder.dataset.orderId || holder.dataset.orderid || '').trim();
-      if (vendor !== '' && orderId !== '') {
-        return {vendor: vendor, order_id: orderId};
-      }
-    }
-
-    return null;
-  }
-
-  var pending = [];
-
-  function syncPostOnly(cb) {
-    var ident = orderIdentityFromInput(cb);
-    if (!ident) {
-      console.warn('Could not determine invoice identity for Post only invoice checkbox', cb);
-      return Promise.resolve(false);
-    }
-
-    var fd = new FormData();
-    fd.set('action', 'set_post_only_invoice');
-    fd.set('ajax', '1');
-    fd.set('mode', 'bills');
-    fd.set('vendor', ident.vendor);
-    fd.set('order_id', ident.order_id);
-    fd.set('enabled', cb.checked ? '1' : '0');
-
-    cb.dataset.postOnlySaving = '1';
-
-    var p = fetch(window.location.pathname + window.location.search, {
-      method: 'POST',
-      credentials: 'same-origin',
-      body: fd
-    }).then(function(resp) {
-      if (!resp.ok) throw new Error('HTTP ' + resp.status);
-      return resp.json();
-    }).then(function(data) {
-      if (!data || !data.ok) throw new Error((data && data.error) ? data.error : 'Post-only autosave failed');
-      cb.dataset.postOnlySaved = cb.checked ? '1' : '0';
-      delete cb.dataset.postOnlyError;
-      return true;
-    }).catch(function(err) {
-      cb.dataset.postOnlyError = String(err && err.message ? err.message : err);
-      console.error('Post-only invoice autosave failed:', err);
-      alert('Could not save Post only invoice flag. Click "Save this invoice" before validating/exporting. Error: ' + cb.dataset.postOnlyError);
-      return false;
-    }).finally(function() {
-      delete cb.dataset.postOnlySaving;
-    });
-
-    pending.push(p);
-    p.finally(function() {
-      pending = pending.filter(function(x) { return x !== p; });
-    });
-
-    return p;
-  }
-
-  function syncVisiblePostOnlyInputs() {
-    var jobs = [];
-    postOnlyInputs().forEach(function(cb) {
-      var saved = cb.dataset.postOnlySaved;
-      var current = cb.checked ? '1' : '0';
-      if (saved !== current) {
-        jobs.push(syncPostOnly(cb));
-      }
-    });
-    return Promise.allSettled(jobs.concat(pending));
-  }
-
-  document.addEventListener('change', function(ev) {
-    var cb = ev.target;
-    if (!cb || cb.type !== 'checkbox') return;
-
-    var isPostOnly =
-      (cb.name || '').indexOf('post_only') !== -1 ||
-      cb.hasAttribute('data-post-only-invoice-autosave') ||
-      (cb.closest('label') && (cb.closest('label').textContent || '').indexOf('Post only invoice') !== -1);
-
-    if (!isPostOnly) return;
-
-    syncPostOnly(cb);
-  }, true);
-
-  document.addEventListener('submit', function(ev) {
-    var form = ev.target;
-    if (!form || !form.querySelector) return;
-
-    var actionField = form.querySelector('input[name="action"]');
-    var action = actionField ? actionField.value : '';
-
-    if (['validate_export', 'export', 'export_range'].indexOf(action) === -1) return;
-    if (form.dataset.postOnlySyncSubmit === '1') return;
-
-    ev.preventDefault();
-
-    syncVisiblePostOnlyInputs().then(function(results) {
-      var failed = results.some(function(r) {
-        if (r.status === 'rejected') return true;
-        if (Array.isArray(r.value)) {
-          return r.value.some(function(inner) {
-            return inner.status === 'rejected' || (inner.status === 'fulfilled' && inner.value === false);
-          });
-        }
-        return r.value === false;
-      });
-
-      if (failed) return;
-
-      form.dataset.postOnlySyncSubmit = '1';
-      if (form.requestSubmit) {
-        form.requestSubmit();
-      } else {
-        form.submit();
-      }
-    });
-  }, true);
-
-  document.addEventListener('DOMContentLoaded', function() {
-    postOnlyInputs().forEach(function(cb) {
-      cb.dataset.postOnlySaved = cb.checked ? '1' : '0';
-    });
-  });
-})();
-</script>
-
-
-
-<script>
-(function(){
-  var EXPORT_ACTIONS = ['validate_export', 'export', 'export_range'];
-
-  function isVisible(el) {
-    return !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
-  }
-
-  function allExportForms() {
-    var out = [];
-    document.querySelectorAll('form').forEach(function(form) {
-      var actionField = form.querySelector('input[name="action"]');
-      var action = actionField ? actionField.value : '';
-      if (EXPORT_ACTIONS.indexOf(action) !== -1) out.push(form);
-    });
-    return out;
-  }
-
-  function visiblePostOnlyCheckboxes() {
-    var out = [];
-
-    document.querySelectorAll('label').forEach(function(label) {
-      if ((label.textContent || '').indexOf('Post only invoice') === -1) return;
-      var cb = label.querySelector('input[type="checkbox"]');
-      if (cb && out.indexOf(cb) === -1 && isVisible(cb)) out.push(cb);
-    });
-
-    [
-      'input[type="checkbox"][name*="post_only"]',
-      'input[type="checkbox"][data-post-only-invoice-autosave]',
-      'input[type="checkbox"][data-post-only-invoice-state]'
-    ].forEach(function(sel) {
-      document.querySelectorAll(sel).forEach(function(cb) {
-        if (out.indexOf(cb) === -1 && isVisible(cb)) out.push(cb);
-      });
-    });
-
-    return out;
-  }
-
-  function orderCardForCheckbox(cb) {
-    return cb.closest('.card, section, article, form, div') || document.body;
-  }
-
-  function keyFromVisibleContext(cb) {
-    var key = (cb.dataset.postOnlyKey || cb.dataset.postonlykey || '').trim();
-    if (key.indexOf('|') !== -1) return key;
-
-    var vendor = (cb.dataset.vendor || '').trim().toLowerCase();
-    var orderId = (cb.dataset.orderId || cb.dataset.orderid || '').trim();
-    if (vendor !== '' && orderId !== '') return vendor + '|' + orderId;
-
-    var name = cb.getAttribute('name') || '';
-    var m = name.match(/\[([^\]]+\|[^\]]+)\]/);
-    if (m) return m[1];
-
-    if (cb.value && cb.value.indexOf('|') !== -1) return cb.value;
-
-    var node = cb.closest('[data-post-only-key], [data-postonlykey], [data-vendor][data-order-id], [data-vendor][data-orderid]');
-    if (node) {
-      key = (node.dataset.postOnlyKey || node.dataset.postonlykey || '').trim();
-      if (key.indexOf('|') !== -1) return key;
-
-      vendor = (node.dataset.vendor || '').trim().toLowerCase();
-      orderId = (node.dataset.orderId || node.dataset.orderid || '').trim();
-      if (vendor !== '' && orderId !== '') return vendor + '|' + orderId;
-    }
-
-    var card = orderCardForCheckbox(cb);
-    var text = (card.textContent || '').replace(/\s+/g, ' ');
-
-    // Amazon order IDs.
-    var amazon = text.match(/\d{3}-\d{7}-\d{7}/);
-    if (amazon) {
-      orderId = amazon[0];
-      vendor = 'amazon';
-      return vendor + '|' + orderId;
-    }
-
-    // TSC in-store/order IDs in staged bill IDs.
-    var tsc = text.match(/TSC-[A-Z0-9-]+|\d{9,}/);
-    if (tsc && /tractor supply|tsc/i.test(text)) {
-      return 'tractor_supply|' + tsc[0];
-    }
-
-    // Lowe's and other vendors generally have an explicit vendor word near the card.
-    var genericOrder = text.match(/\d{6,}[-A-Z0-9]*/);
-    if (genericOrder) {
-      orderId = genericOrder[0];
-      if (/lowe/i.test(text)) vendor = 'lowes';
-      else if (/costco/i.test(text)) vendor = 'costco';
-      else if (/walmart/i.test(text)) vendor = 'walmart';
-      else if (/home depot/i.test(text)) vendor = 'home_depot';
-      if (vendor !== '') return vendor + '|' + orderId;
-    }
-
-    return '';
-  }
-
-  function collectPostOnlyStates() {
-    var states = {};
-    visiblePostOnlyCheckboxes().forEach(function(cb) {
-      var key = keyFromVisibleContext(cb);
-      if (key === '') {
-        console.warn('Could not determine vendor/order key for Post only invoice checkbox', cb);
-        return;
-      }
-      states[key] = cb.checked ? '1' : '0';
-    });
-    return states;
-  }
-
-  function syncStatesToExportForm(form) {
-    form.querySelectorAll('input[data-generated-post-only-state="1"]').forEach(function(el) {
-      el.remove();
-    });
-
-    var states = collectPostOnlyStates();
-    Object.keys(states).forEach(function(key) {
-      var hidden = document.createElement('input');
-      hidden.type = 'hidden';
-      hidden.name = 'post_only_state[' + key + ']';
-      hidden.value = states[key];
-      hidden.setAttribute('data-generated-post-only-state', '1');
-      form.appendChild(hidden);
-    });
-  }
-
-  function syncAllExportForms() {
-    allExportForms().forEach(syncStatesToExportForm);
-  }
-
-  document.addEventListener('change', function(ev) {
-    var cb = ev.target;
-    if (!cb || cb.type !== 'checkbox') return;
-
-    var isPostOnly =
-      (cb.name || '').indexOf('post_only') !== -1 ||
-      cb.hasAttribute('data-post-only-invoice-autosave') ||
-      cb.hasAttribute('data-post-only-invoice-state') ||
-      (cb.closest('label') && (cb.closest('label').textContent || '').indexOf('Post only invoice') !== -1);
-
-    if (!isPostOnly) return;
-    syncAllExportForms();
-  }, true);
-
-  document.addEventListener('click', function(ev) {
-    var btn = ev.target && ev.target.closest ? ev.target.closest('button, input[type="submit"]') : null;
-    if (!btn) return;
-    var form = btn.form || btn.closest('form');
-    if (!form) return;
-    var actionField = form.querySelector('input[name="action"]');
-    var action = actionField ? actionField.value : '';
-    if (EXPORT_ACTIONS.indexOf(action) === -1) return;
-
-    window.__gnucashToolIntentionalExportSubmit = true;
-    syncStatesToExportForm(form);
-  }, true);
-
-  document.addEventListener('submit', function(ev) {
-    var form = ev.target;
-    if (!form || !form.querySelector) return;
-    var actionField = form.querySelector('input[name="action"]');
-    var action = actionField ? actionField.value : '';
-    if (EXPORT_ACTIONS.indexOf(action) === -1) return;
-
-    window.__gnucashToolIntentionalExportSubmit = true;
-    syncStatesToExportForm(form);
-  }, true);
-
-  // Suppress the native unsaved-changes prompt for intentional validate/export submissions.
-  window.addEventListener('beforeunload', function(ev) {
-    if (!window.__gnucashToolIntentionalExportSubmit) return;
-    ev.stopImmediatePropagation();
-    delete ev.returnValue;
-    return undefined;
-  }, true);
-
-  document.addEventListener('DOMContentLoaded', syncAllExportForms);
-})();
-</script>
-
-<script id="v207m-post-only-submit-keyfix">
-(function(){
-  var EXPORT_ACTIONS = ['validate_export', 'export', 'export_range'];
-
-  function formAction(form) {
-    var field = form && form.querySelector ? form.querySelector('input[name="action"]') : null;
-    return field ? field.value : '';
-  }
-
-  function exportForms() {
-    var forms = [];
-    document.querySelectorAll('form').forEach(function(form) {
-      if (EXPORT_ACTIONS.indexOf(formAction(form)) !== -1) forms.push(form);
-    });
-    return forms;
-  }
-
-  function isVisible(el) {
-    return !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
-  }
-
-  function postOnlyCheckboxes() {
-    var out = [];
-
-    document.querySelectorAll('label').forEach(function(label) {
-      if ((label.textContent || '').indexOf('Post only invoice') === -1) return;
-      var cb = label.querySelector('input[type="checkbox"]');
-      if (cb && out.indexOf(cb) === -1 && isVisible(cb)) out.push(cb);
-    });
-
-    [
-      'input[type="checkbox"][name*="post_only"]',
-      'input[type="checkbox"][data-post-only-invoice-autosave]',
-      'input[type="checkbox"][data-post-only-invoice-state]',
-      'input[type="checkbox"][data-post-only-key]'
-    ].forEach(function(sel) {
-      document.querySelectorAll(sel).forEach(function(cb) {
-        if (out.indexOf(cb) === -1 && isVisible(cb)) out.push(cb);
-      });
-    });
-
-    return out;
-  }
-
-  function orderKeyFromText(text) {
-    text = (text || '').replace(/\s+/g, ' ');
-
-    var m = text.match(/\b(\d{3}-\d{7}-\d{7})\b/);
-    if (m) return 'amazon|' + m[1];
-
-    m = text.match(/\b(TSC-[A-Z0-9-]+)\b/i);
-    if (m) return 'tractor_supply|' + m[1];
-
-    if (/tractor supply|\btsc\b/i.test(text)) {
-      m = text.match(/\b(\d{9,})\b/);
-      if (m) return 'tractor_supply|' + m[1];
-    }
-
-    if (/lowe/i.test(text)) {
-      m = text.match(/\b(\d{6,}[-A-Z0-9]*)\b/);
-      if (m) return 'lowes|' + m[1];
-    }
-
-    if (/costco/i.test(text)) {
-      m = text.match(/\b(\d{6,}[-A-Z0-9]*)\b/);
-      if (m) return 'costco|' + m[1];
-    }
-
-    if (/walmart/i.test(text)) {
-      m = text.match(/\b(\d{6,}[-A-Z0-9]*)\b/);
-      if (m) return 'walmart|' + m[1];
-    }
-
-    if (/home depot/i.test(text)) {
-      m = text.match(/\b(\d{6,}[-A-Z0-9]*)\b/);
-      if (m) return 'home_depot|' + m[1];
-    }
-
-    return '';
-  }
-
-  function postOnlyKey(cb) {
-    var key = (cb.dataset.postOnlyKey || cb.dataset.postonlykey || '').trim();
-    if (key.indexOf('|') !== -1) return key;
-
-    var vendor = (cb.dataset.vendor || '').trim().toLowerCase();
-    var orderId = (cb.dataset.orderId || cb.dataset.orderid || '').trim();
-    if (vendor !== '' && orderId !== '') return vendor + '|' + orderId;
-
-    var name = cb.getAttribute('name') || '';
-    var n = name.match(/\[([^\]]+\|[^\]]+)\]/);
-    if (n) return n[1];
-
-    if (cb.value && cb.value.indexOf('|') !== -1) return cb.value;
-
-    // Walk up the DOM until we find a nearby container that includes an order ID.
-    var node = cb;
-    var best = '';
-    for (var depth = 0; node && node !== document.body && depth < 12; depth++, node = node.parentElement) {
-      if (node.dataset) {
-        key = (node.dataset.postOnlyKey || node.dataset.postonlykey || '').trim();
-        if (key.indexOf('|') !== -1) return key;
-
-        vendor = (node.dataset.vendor || '').trim().toLowerCase();
-        orderId = (node.dataset.orderId || node.dataset.orderid || '').trim();
-        if (vendor !== '' && orderId !== '') return vendor + '|' + orderId;
-      }
-
-      var text = node.textContent || '';
-      key = orderKeyFromText(text);
-      if (key !== '') {
-        best = key;
-        // Prefer a small-ish ancestor so body/global text cannot grab the wrong order.
-        if (text.length < 6000) return key;
-      }
-    }
-
-    if (best !== '') return best;
-
-    // Last resort for single-order filtered pages.
-    var bodyKey = orderKeyFromText(document.body ? document.body.textContent : '');
-    return bodyKey;
-  }
-
-  function currentStates() {
-    var states = {};
-    postOnlyCheckboxes().forEach(function(cb) {
-      var key = postOnlyKey(cb);
-      if (key === '') {
-        console.warn('Post-only invoice checkbox has no vendor/order key', cb);
-        return;
-      }
-      states[key] = cb.checked ? '1' : '0';
-    });
-    return states;
-  }
-
-  function syncStatesToForm(form) {
-    form.querySelectorAll('input[data-v207m-post-only-state="1"]').forEach(function(el) {
-      el.remove();
-    });
-
-    var states = currentStates();
-    Object.keys(states).forEach(function(key) {
-      var hidden = document.createElement('input');
-      hidden.type = 'hidden';
-      hidden.name = 'post_only_state[' + key + ']';
-      hidden.value = states[key];
-      hidden.setAttribute('data-v207m-post-only-state', '1');
-      form.appendChild(hidden);
-    });
-
-    if (Object.keys(states).length === 0) {
-      console.warn('No visible Post-only invoice checkboxes were found to sync.');
-    }
-  }
-
-  function syncAllExportForms() {
-    exportForms().forEach(syncStatesToForm);
-  }
-
-  function ajaxSaveCheckbox(cb) {
-    var key = postOnlyKey(cb);
-    if (key === '' || key.indexOf('|') === -1) return;
-
-    var parts = key.split('|');
-    var vendor = parts.shift();
-    var orderId = parts.join('|');
-
-    var fd = new FormData();
-    fd.set('action', 'set_post_only_invoice');
-    fd.set('ajax', '1');
-    fd.set('mode', 'bills');
-    fd.set('vendor', vendor);
-    fd.set('order_id', orderId);
-    fd.set('enabled', cb.checked ? '1' : '0');
-
-    fetch(window.location.pathname + window.location.search, {
-      method: 'POST',
-      credentials: 'same-origin',
-      body: fd
-    }).then(function(resp) {
-      if (!resp.ok) throw new Error('HTTP ' + resp.status);
-      return resp.json();
-    }).then(function(data) {
-      if (!data || !data.ok) throw new Error((data && data.error) ? data.error : 'save failed');
-      cb.dataset.postOnlySaved = cb.checked ? '1' : '0';
-    }).catch(function(err) {
-      console.warn('Post-only autosave failed; Validate/Export submit will still send the state.', err);
-    });
-  }
-
-  document.addEventListener('change', function(ev) {
-    var cb = ev.target;
-    if (!cb || cb.type !== 'checkbox') return;
-
-    var isPostOnly =
-      (cb.name || '').indexOf('post_only') !== -1 ||
-      cb.hasAttribute('data-post-only-key') ||
-      cb.hasAttribute('data-post-only-invoice-autosave') ||
-      cb.hasAttribute('data-post-only-invoice-state') ||
-      (cb.closest('label') && (cb.closest('label').textContent || '').indexOf('Post only invoice') !== -1);
-
-    if (!isPostOnly) return;
-
-    syncAllExportForms();
-    ajaxSaveCheckbox(cb);
-  }, true);
-
-  document.addEventListener('click', function(ev) {
-    var btn = ev.target && ev.target.closest ? ev.target.closest('button, input[type="submit"]') : null;
-    if (!btn) return;
-
-    var form = btn.form || btn.closest('form');
-    if (!form || EXPORT_ACTIONS.indexOf(formAction(form)) === -1) return;
-
-    window.__gnucashToolIntentionalExportSubmit = true;
-    window.onbeforeunload = null;
-    syncStatesToForm(form);
-  }, true);
-
-  document.addEventListener('submit', function(ev) {
-    var form = ev.target;
-    if (!form || EXPORT_ACTIONS.indexOf(formAction(form)) === -1) return;
-
-    window.__gnucashToolIntentionalExportSubmit = true;
-    window.onbeforeunload = null;
-    syncStatesToForm(form);
-  }, true);
-
-  window.addEventListener('beforeunload', function(ev) {
-    if (!window.__gnucashToolIntentionalExportSubmit) return;
-    ev.stopImmediatePropagation();
-    delete ev.returnValue;
-    return undefined;
-  }, true);
-
-  document.addEventListener('DOMContentLoaded', syncAllExportForms);
-})();
-</script>
 
 </body></html>
