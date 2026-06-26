@@ -9,7 +9,7 @@
 
 declare(strict_types=1);
 
-const APP_VERSION = 'v207h';
+const APP_VERSION = 'v207i';
 const APP_DB = __DIR__ . '/data/review.sqlite';
 const DEFAULT_VENDOR_AMAZON = '000005';
 const DEFAULT_VENDOR_COSTCO = '000001';
@@ -8362,12 +8362,21 @@ function export_gnucash_bill_csv(SQLite3 $db, string $outPath, bool $withHeader 
         $exportDate = format_gnucash_post_date($date, $postDateFormat);
         $billing = strtoupper((string)$r['vendor']) . ' ' . $id; $notes = trim((string)$r['notes']);
         $rowVendor = (string)$r['vendor'];
-        $rowPostInvoices = $postInvoices || vendor_requires_posted_bill_export($rowVendor);
+        $rowPostInvoices = $postInvoices || vendor_requires_posted_bill_export($rowVendor) || ((int)($r['post_only_invoice'] ?? 0) === 1);
         $datePosted = $rowPostInvoices ? $exportDate : '';
         $dueDate = $rowPostInvoices ? $exportDate : '';
         $acctPosted = $rowPostInvoices ? export_account_name($postingAccount, $accountPrefix) : '';
         $memoPosted = $rowPostInvoices ? ('Imported vendor bill ' . $billing) : '';
-        $itemRes = $db->query("SELECT * FROM order_items WHERE vendor='" . SQLite3::escapeString($r['vendor']) . "' AND order_id='" . SQLite3::escapeString($id) . "' AND skip=0 ORDER BY description");
+        if ((int)($r['post_only_invoice'] ?? 0) === 1) {
+            if ($datePosted === '') $datePosted = $exportDate;
+            if ($dueDate === '') $dueDate = $exportDate;
+            if ($acctPosted === '') $acctPosted = export_account_name($postingAccount, $accountPrefix);
+            if ($memoPosted === '') $memoPosted = 'Post existing vendor bill ' . $billing;
+            // Post-only invoice export row: intentionally suppress all bill line items, shipping, tax, and amounts.
+            fputcsv($fh, [$id,$exportDate,$vendor_id,$billing,$notes,'','','','','','','','','','N','N','',$datePosted,$dueDate,$acctPosted,$memoPosted,'N']);
+            $n++;
+            continue;
+        } $itemRes = $db->query("SELECT * FROM order_items WHERE vendor='" . SQLite3::escapeString($r['vendor']) . "' AND order_id='" . SQLite3::escapeString($id) . "' AND skip=0 ORDER BY description");
         $itemCount = 0;
         while ($it = $itemRes->fetchArray(SQLITE3_ASSOC)) {
             $qty = (float)$it['quantity']; if (abs($qty) < 0.0001) $qty = 1.0; $price = (float)$it['unit_price'];
