@@ -9,7 +9,7 @@
 
 declare(strict_types=1);
 
-const APP_VERSION = 'v207q';
+const APP_VERSION = 'v207s';
 const APP_DB = __DIR__ . '/data/review.sqlite';
 const DEFAULT_VENDOR_AMAZON = '000005';
 const DEFAULT_VENDOR_COSTCO = '000001';
@@ -3308,7 +3308,23 @@ function run_amazon_invoice_repair_apply_script(string $gnucashPath, string $pla
     return [$code, $text];
 }
 
-function run_payment_apply_script(string $gnucashPath, string $planPath, string $outPath, bool $apply, string $logPath, bool $matchExisting = true, bool $noCreateMissing = true, int $dateWindowDays = 5, bool $allowNonCopyName = false): array {
+function payment_apply_match_window_before_days(SQLite3 $db): int {
+    $raw = trim((string)get_config($db, 'payment_apply_match_window_before_days', '0'));
+    if ($raw === '' || !preg_match('/^-?\d+$/', $raw)) return 0;
+    return max(0, min(365, (int)$raw));
+}
+
+function payment_apply_match_window_after_days(SQLite3 $db): int {
+    $raw = trim((string)get_config($db, 'payment_apply_match_window_after_days', '14'));
+    if ($raw === '' || !preg_match('/^-?\d+$/', $raw)) return 14;
+    return max(0, min(365, (int)$raw));
+}
+
+function payment_apply_match_window_label(SQLite3 $db): string {
+    return '-' . payment_apply_match_window_before_days($db) . '..+' . payment_apply_match_window_after_days($db) . ' day(s)';
+}
+
+function run_payment_apply_script(string $gnucashPath, string $planPath, string $outPath, bool $apply, string $logPath, bool $matchExisting = true, bool $noCreateMissing = true, int $dateWindowDays = 5, bool $allowNonCopyName = false, int $dateWindowBeforeDays = 0): array {
     $script = __DIR__ . '/gnucash_payment_apply_v1.py';
     if (!is_file($script)) return [127, 'Payment apply script missing: ' . $script];
     if (!is_file($planPath)) return [2, 'Payment plan file not found: ' . $planPath];
@@ -3328,7 +3344,8 @@ function run_payment_apply_script(string $gnucashPath, string $planPath, string 
         ' --out ' . escapeshellarg($outPath) .
         ($matchExisting ? ' --match-existing' : '') .
         ($noCreateMissing ? ' --no-create-missing' : '') .
-        ' --match-date-window-days ' . escapeshellarg((string)max(0, $dateWindowDays)) .
+        ' --match-date-window-before-days ' . escapeshellarg((string)max(0, $dateWindowBeforeDays)) .
+        ' --match-date-window-after-days ' . escapeshellarg((string)max(0, $dateWindowDays)) .
         ($apply && $allowNonCopyName ? ' --allow-non-copy-name' : '') .
         ($apply ? ' --apply' : ' --dry-run');
     $output = [];
@@ -8647,7 +8664,26 @@ if (($request['action'] ?? '') === 'save_default_variables') {
         foreach (['gnucash_db_host','gnucash_db_port','gnucash_db_name','gnucash_db_user','gnucash_db_pass'] as $k) set_config($db, $k, (string)($request[$k] ?? ''));
         $message = 'Saved GnuCash read-only backend settings for ' . strtoupper($backend) . '.';
     }
-    if (($request['action'] ?? '') === 'reset_transaction_matching') {
+    if (($request['action'] ?? '') === 'save_payment_apply_match_window') {
+    $before = trim((string)($request['payment_match_before_days'] ?? '0'));
+    $after = trim((string)($request['payment_match_after_days'] ?? '14'));
+
+    if ($before === '' || !preg_match('/^-?\d+$/', $before)) $before = '0';
+    if ($after === '' || !preg_match('/^-?\d+$/', $after)) $after = '14';
+
+    $before = (string)max(0, min(365, (int)$before));
+    $after = (string)max(0, min(365, (int)$after));
+
+    set_config($db, 'payment_apply_match_window_before_days', $before);
+    set_config($db, 'payment_apply_match_window_after_days', $after);
+
+    $message = 'Saved transaction match window adjustment: look for payments from ' . $before . ' day(s) before through ' . $after . ' day(s) after the vendor payment date.';
+    $mode = 'transactions';
+    $paymentWizardStep = 'apply';
+    set_config($db, 'ui_mode', $mode);
+}
+
+if (($request['action'] ?? '') === 'reset_transaction_matching') {
         $resetVendor = strtolower((string)($request['payment_vendor'] ?? 'amazon'));
         if (!in_array($resetVendor, ['amazon','all'], true)) $resetVendor = 'amazon';
         try {
@@ -9303,7 +9339,7 @@ if (($request['action'] ?? '') === 'export_vendor_ledger_diff_report') {
                 set_config($db, 'last_lowes_payment_dryrun_skips', '0');
                 set_config($db, 'last_lowes_payment_dryrun_ready', '0');
             } else {
-                [$code, $console] = run_payment_apply_script((string)$gnucashPath, $readyPath, $dryRunPath, false, $logPath, true, true, lowes_payment_match_date_window_days($db));
+                [$code, $console] = run_payment_apply_script((string)$gnucashPath, $readyPath, $dryRunPath, false, $logPath, true, true, lowes_payment_match_date_window_days($db), false, 0);
                 $dryCounts = payment_apply_result_status_counts($dryRunPath);
                 if (is_file($dryRunPath)) $exportLinks[] = ['name'=>$dryRunName, 'batch'=>'lowes-dry-run-result', 'count'=>$dryCounts['rows'], 'rows'=>$dryCounts['rows'], 'first'=>'', 'last'=>''];
                 if (is_file($logPath)) $exportLinks[] = ['name'=>$logName, 'batch'=>'lowes-dry-run-log', 'count'=>'', 'rows'=>'', 'first'=>'', 'last'=>''];
@@ -9374,7 +9410,7 @@ if (($request['action'] ?? '') === 'export_vendor_ledger_diff_report') {
             $applyLogName = 'lowes-payment-match-apply-log-' . $stamp . '-' . APP_VERSION . '.txt';
             $applyPath = __DIR__ . '/exports/' . $applyName;
             $applyLogPath = __DIR__ . '/exports/' . $applyLogName;
-            [$code, $console] = run_payment_apply_script((string)$gnucashPath, $readyPath, $applyPath, true, $applyLogPath, true, true, lowes_payment_match_date_window_days($db), true);
+            [$code, $console] = run_payment_apply_script((string)$gnucashPath, $readyPath, $applyPath, true, $applyLogPath, true, true, lowes_payment_match_date_window_days($db), true, 0);
             $applyCounts = payment_apply_result_status_counts($applyPath);
             if (isset($backupBookName) && is_file(__DIR__ . '/exports/' . basename($backupBookName))) {
                 $exportLinks[] = ['name'=>$backupBookName, 'batch'=>'pre-apply GnuCash backup copy', 'count'=>'', 'rows'=>'', 'first'=>'', 'last'=>''];
@@ -9784,9 +9820,9 @@ $scriptArg = escapeshellarg(__DIR__ . '/gnucash_payment_apply_v1.py');
 $planArg = escapeshellarg($lastReadyPaymentPlanPath);
 $dryOutArg = escapeshellarg($paymentDryRunOutPath);
 $applyOutArg = escapeshellarg($paymentApplyOutPath);
-$applyLogArg = escapeshellarg($paymentApplyLogPath);
-$step5DryRunCommand = "HOME='/tmp/gnucash-repair-www' \\\nXDG_CACHE_HOME='/tmp/gnucash-repair-www/cache' \\\nGSETTINGS_BACKEND=memory \\\nXDG_DATA_DIRS=/usr/local/share:/usr/share \\\npython3 $scriptArg \\\n  --book $bookArg \\\n  --plan $planArg \\\n  --out $dryOutArg \\\n  --match-existing \\\n  --no-create-missing \\\n  --match-date-window-days 14 \\\n  --dry-run";
-$step5ApplyCommand = "HOME='/tmp/gnucash-repair-www' \\\nXDG_CACHE_HOME='/tmp/gnucash-repair-www/cache' \\\nGSETTINGS_BACKEND=memory \\\nXDG_DATA_DIRS=/usr/local/share:/usr/share \\\npython3 $scriptArg \\\n  --book $bookArg \\\n  --plan $planArg \\\n  --out $applyOutArg \\\n  --match-existing \\\n  --no-create-missing \\\n  --match-date-window-days 14 \\\n  --apply 2>&1 | tee $applyLogArg";
+$applyLogArg = escapeshellarg($paymentApplyLogPath); $paymentMatchWindowBeforeDays = payment_apply_match_window_before_days($db); $paymentMatchWindowAfterDays = payment_apply_match_window_after_days($db); $paymentMatchWindowBeforeArg = escapeshellarg((string)$paymentMatchWindowBeforeDays); $paymentMatchWindowAfterArg = escapeshellarg((string)$paymentMatchWindowAfterDays);
+$step5DryRunCommand = "HOME='/tmp/gnucash-repair-www' \\\nXDG_CACHE_HOME='/tmp/gnucash-repair-www/cache' \\\nGSETTINGS_BACKEND=memory \\\nXDG_DATA_DIRS=/usr/local/share:/usr/share \\\npython3 $scriptArg \\\n  --book $bookArg \\\n  --plan $planArg \\\n  --out $dryOutArg \\\n  --match-existing \\\n  --no-create-missing \\\n  --match-date-window-before-days $paymentMatchWindowBeforeArg \\\n  --match-date-window-after-days $paymentMatchWindowAfterArg \\\n  --dry-run";
+$step5ApplyCommand = "HOME='/tmp/gnucash-repair-www' \\\nXDG_CACHE_HOME='/tmp/gnucash-repair-www/cache' \\\nGSETTINGS_BACKEND=memory \\\nXDG_DATA_DIRS=/usr/local/share:/usr/share \\\npython3 $scriptArg \\\n  --book $bookArg \\\n  --plan $planArg \\\n  --out $applyOutArg \\\n  --match-existing \\\n  --no-create-missing \\\n  --match-date-window-before-days $paymentMatchWindowBeforeArg \\\n  --match-date-window-after-days $paymentMatchWindowAfterArg \\\n  --apply 2>&1 | tee $applyLogArg";
 $creditScriptArg = escapeshellarg(__DIR__ . '/gnucash_credit_refund_match_v1.py');
 $creditStamp = date('Ymd-His');
 $creditDryRunOutPath = __DIR__ . '/exports/amazon-credit-refund-match-dryrun-' . $creditStamp . '-' . APP_VERSION . '.csv';
@@ -10383,7 +10419,19 @@ CMD;
 <?php elseif($paymentWizardStep==='ready'): ?>
 <h3>Step 4 — Ready-to-apply payment plan</h3><p><?=count($paymentReadyRows)?> row(s) are currently classified as <code>ready_exact_payment</code> or <code>ready_split_payment_group</code>. Export this subset for the GnuCash dry-run/apply script.</p><form method="post"><input type="hidden" name="action" value="export_ready_payment_application_plan"><input type="hidden" name="mode" value="transactions"><input type="hidden" name="date_sort" value="<?=h($dateSort)?>"><input type="hidden" name="payment_wizard_step" value="ready"><button type="submit">Export ready-to-apply plan only</button></form><?php if($hasReadyPaymentPlan): ?><p class="small">Last exported plan: <code><?=h($lastReadyPaymentPlanName)?></code>, <?=h($lastReadyPaymentPlanCount)?> row(s), created <?=h($lastReadyPaymentPlanCreated)?>.</p><p><a class="wizard-step ok" href="?mode=transactions&date_sort=<?=urlencode($dateSort)?>&payment_wizard_step=apply#payment-wizard">Continue to payment match/apply prep</a></p><?php else: ?><p class="warn">Export the ready-to-apply plan before continuing to Step 5. This prevents the command block from using a placeholder or stale plan path.</p><?php endif; ?><p class="small">Rows already marked <code>already_applied_ok</code> are intentionally skipped. Rows with missing invoices, wrong/unverified accounts, unposted invoices, or amount mismatches are not included.</p>
 <?php elseif($paymentWizardStep==='apply'): ?>
-<h3>Step 5 — Match/apply existing payment transactions</h3><p>The write/apply phase is handled by <code>gnucash_payment_apply_v1.py</code>. In <?=h(APP_VERSION)?> the recommended command first tries to match existing imported bank/gift-card transactions and attach their offset split to the bill lot, instead of creating duplicate payment transactions.</p><?php if(!$hasReadyPaymentPlan): ?><p class="warn">No ready-payment plan has been exported in this browser tool session. Go back to Step 4 and export the ready plan first. Step 5 commands are intentionally hidden until a plan file exists.</p><p><a class="wizard-step" href="?mode=transactions&date_sort=<?=urlencode($dateSort)?>&payment_wizard_step=ready#payment-wizard">Return to Step 4 — Ready plan</a></p><?php else: ?><p class="small">Using last exported plan: <code><?=h($lastReadyPaymentPlanName)?></code>.</p><h4>Dry-run command, match existing only</h4><textarea readonly spellcheck="false" class="command-box small"><?=h($step5DryRunCommand)?></textarea><h4>Apply command, match existing only</h4><textarea readonly spellcheck="false" class="command-box small"><?=h($step5ApplyCommand)?></textarea><ol class="small"><li>Run the dry-run first. The script prints a summary of matched rows, errors, and invoice groups; proceed only when it reports zero errors and says it is ready for apply.</li><li>Run apply against <code>.apitest</code> only.</li><li>Open copied book in GnuCash and validate A/P, bills, payment dates, and vendor reports.</li><li>Use the old create-new behavior only as a deliberate fallback by removing <code>--match-existing --no-create-missing</code>.</li></ol><p><a class="wizard-step ok" href="?mode=transactions&date_sort=<?=urlencode($dateSort)?>&payment_wizard_step=credit#payment-wizard">Continue to credit/refund matching</a></p><?php endif; ?>
+<h3>Step 5 — Match/apply existing payment transactions</h3><p>The write/apply phase is handled by <code>gnucash_payment_apply_v1.py</code>. In <?=h(APP_VERSION)?> the recommended command first tries to match existing imported bank/gift-card transactions and attach their offset split to the bill lot, instead of creating duplicate payment transactions.</p><?php if(!$hasReadyPaymentPlan): ?><p class="warn">No ready-payment plan has been exported in this browser tool session. Go back to Step 4 and export the ready plan first. Step 5 commands are intentionally hidden until a plan file exists.</p><p><a class="wizard-step" href="?mode=transactions&date_sort=<?=urlencode($dateSort)?>&payment_wizard_step=ready#payment-wizard">Return to Step 4 — Ready plan</a></p><?php else: ?><p class="small">Using last exported plan: <code><?=h($lastReadyPaymentPlanName)?></code>.</p><div class="card" style="background:#eef7ff;border-color:#1f6fb2;margin:.75rem 0">
+<h4>Transaction match window adjustment</h4>
+<p class="small">Use this when imported bank/card/stored-value register transactions post before or after the vendor payment date. The dry-run/apply matcher will look for existing payment transactions in the mapped account within this date window.</p>
+<form method="post" style="display:flex;gap:.75rem;align-items:end;flex-wrap:wrap">
+<input type="hidden" name="action" value="save_payment_apply_match_window">
+<input type="hidden" name="mode" value="transactions">
+<input type="hidden" name="payment_wizard_step" value="apply">
+<label>Days before transaction<input type="number" min="0" max="365" name="payment_match_before_days" value="<?=h((string)$paymentMatchWindowBeforeDays)?>" style="width:8rem"></label>
+<label>Days after transaction<input type="number" min="0" max="365" name="payment_match_after_days" value="<?=h((string)$paymentMatchWindowAfterDays)?>" style="width:8rem"></label>
+<button type="submit">Save match window</button>
+<span class="small">Current search window: <strong><?=h(payment_apply_match_window_label($db))?></strong>.</span>
+</form>
+</div><h4>Dry-run command, match existing only</h4><textarea readonly spellcheck="false" class="command-box small"><?=h($step5DryRunCommand)?></textarea><h4>Apply command, match existing only</h4><textarea readonly spellcheck="false" class="command-box small"><?=h($step5ApplyCommand)?></textarea><ol class="small"><li>Run the dry-run first. The script prints a summary of matched rows, errors, and invoice groups; proceed only when it reports zero errors and says it is ready for apply.</li><li>These commands run against the uploaded <strong>copy</strong> of your primary GnuCash file.</li><li>Once the changes are applied, download the changed copy of your file and validate that all transactions were posted successfully.</li></ol><p><a class="wizard-step ok" href="?mode=transactions&date_sort=<?=urlencode($dateSort)?>&payment_wizard_step=credit#payment-wizard">Continue to credit/refund matching</a></p><?php endif; ?>
 <?php elseif($paymentWizardStep==='credit'): ?>
 <h3>Step 6 — CREDIT / refund matching</h3><p>This step is for <code>*-CREDIT</code> vendor credit bills. It does not create gift-card or credit-card refund transactions. First enter/import the refund activity into the appropriate GnuCash account, then run this matcher to attach matched existing refund splits to the credit bill lots.</p><h4>Dry-run command, match existing refunds only</h4><textarea readonly spellcheck="false" class="command-box small"><?=h($step6CreditDryRunCommand)?></textarea><h4>Apply command, match existing refunds only</h4><textarea readonly spellcheck="false" class="command-box small"><?=h($step6CreditApplyCommand)?></textarea><p class="small">In <?=h(APP_VERSION)?> refund matching uses a forward-only six-month window from the credit invoice date. Exact single refund matches are preferred; if none is safe, the script can match a small combination of unapplied refund transactions that sum to the credit amount. If no matching gift-card or credit-card refund transaction exists, the credit remains a review item instead of being auto-created. Run dry-run first and apply only when the summary reports zero errors/blockers.</p>
 <?php endif; ?>

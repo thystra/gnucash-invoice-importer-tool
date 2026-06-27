@@ -44,6 +44,21 @@ CENT = Decimal('0.01')
 
 READY_STATUSES = {'ready_exact_payment', 'ready_split_payment_group'}
 
+MATCH_DATE_WINDOW_BEFORE_DAYS = 0
+
+def date_offset_in_match_window(dd: int | None, after_days: int) -> bool:
+    if dd is None:
+        return False
+    before = max(0, int(MATCH_DATE_WINDOW_BEFORE_DAYS or 0))
+    after = max(0, int(after_days or 0))
+    return -before <= int(dd) <= after
+
+def match_window_label(after_days: int) -> str:
+    before = max(0, int(MATCH_DATE_WINDOW_BEFORE_DAYS or 0))
+    after = max(0, int(after_days or 0))
+    return f"-{before}..+{after} day(s)"
+
+
 
 def D(value) -> Decimal:
     if value is None:
@@ -268,11 +283,9 @@ def row_date_ymd(value) -> str:
 def date_offset_days(tx_date: str, expected_date: str) -> int | None:
     """Return tx_date - expected_date in days.
 
-    For imported vendor payment matching we intentionally use a one-sided window:
-    bank/credit-card postings and stored-value activity may appear on the vendor
-    payment date or a few days after it, but they should not pre-date the vendor
-    payment record.  This also removes many false ambiguous matches when the same
-    amount appears shortly before and shortly after the expected date.
+    For imported vendor payment matching the default window is still forward-only,
+    but callers may allow a small backward window for card transactions that
+    post before the vendor payment/invoice date.
     """
     tx_date = row_date_ymd(tx_date)
     expected_date = row_date_ymd(expected_date)
@@ -384,7 +397,7 @@ def find_existing_payment_candidate(con: sqlite3.Connection, *, source_account_g
         if not tx_guid:
             continue
         dd = date_offset_days(str(src['tx_post_date'] or ''), desired_date)
-        if dd is None or dd < 0 or dd > date_window_days:
+        if not date_offset_in_match_window(dd, date_window_days):
             continue
         near_src += 1
         splits = usable_tx(tx_guid)
@@ -439,7 +452,7 @@ def find_existing_payment_candidate(con: sqlite3.Connection, *, source_account_g
         if not tx_guid:
             continue
         dd = date_offset_days(str(ap['tx_post_date'] or ''), desired_date)
-        if dd is None or dd < 0 or dd > date_window_days:
+        if not date_offset_in_match_window(dd, date_window_days):
             continue
         near_ap += 1
         splits = usable_tx(tx_guid)
@@ -470,10 +483,12 @@ def find_existing_payment_candidate(con: sqlite3.Connection, *, source_account_g
     # orders as missing even when all component transactions were imported.
     if not candidates and source_abs > Decimal('0.00'):
         partial_options = []
-        start_date = desired_date
         try:
-            end_date = (_dt.date.fromisoformat(desired_date) + _dt.timedelta(days=date_window_days)).isoformat()
+            base_date = _dt.date.fromisoformat(desired_date)
+            start_date = (base_date - _dt.timedelta(days=max(0, int(MATCH_DATE_WINDOW_BEFORE_DAYS or 0)))).isoformat()
+            end_date = (base_date + _dt.timedelta(days=max(0, int(date_window_days or 0)))).isoformat()
         except Exception:
+            start_date = desired_date
             end_date = desired_date
         vendor_desc_clause = ''
         vendor_desc_params = []
@@ -496,7 +511,7 @@ def find_existing_payment_candidate(con: sqlite3.Connection, *, source_account_g
             if not tx_guid:
                 continue
             dd = date_offset_days(str(src['tx_post_date'] or ''), desired_date)
-            if dd is None or dd < 0 or dd > date_window_days:
+            if not date_offset_in_match_window(dd, date_window_days):
                 continue
             part_abs = abs(split_amount_cents(src)).quantize(CENT, rounding=ROUND_HALF_UP)
             if part_abs <= Decimal('0.00') or part_abs > source_abs:
@@ -606,7 +621,7 @@ def find_existing_payment_candidate(con: sqlite3.Connection, *, source_account_g
                 expected = 'positive/decrease/refund source split' if source_amount > 0 else 'negative/increase/charge source split'
                 diagnostic_bits.append(f'same-amount source row exists but has the opposite sign; expected {expected} for this bill/credit target')
         extra = (' ' + ' ; '.join(diagnostic_bits)) if diagnostic_bits else ''
-        return 'not_found', None, f'No existing imported payment transaction found in mapped account within 0..+{date_window_days} day(s).{extra}'
+        return 'not_found', None, f'No existing imported payment transaction found in mapped account within {match_window_label(date_window_days)}.{extra}'
 
     def score(c):
         desc = (c.get('description') or '').lower()
@@ -1133,9 +1148,17 @@ def main() -> int:
     ap.add_argument('--allow-non-copy-name', action='store_true')
     ap.add_argument('--match-existing', action='store_true', help='Prefer matching/reclassifying existing imported bank/gift-card transactions instead of creating duplicates.')
     ap.add_argument('--no-create-missing', action='store_true', help='When --match-existing is used, fail/skip if an existing transaction is not found instead of creating a new one.')
-    ap.add_argument('--match-date-window-days', type=int, default=5, help='Allowed one-sided day window when matching existing imported transactions: expected date through expected date + N days. Default: 5.')
+    ap.add_argument('--match-date-window-days', type=int, default=5,
+                    help='Backward-compatible alias for --match-date-window-after-days. Default: 5.')
+    ap.add_argument('--match-date-window-before-days', type=int, default=0,
+                    help='Allow matching existing imported transactions up to N days before the expected payment date. Default: 0.')
+    ap.add_argument('--match-date-window-after-days', type=int, default=None,
+                    help='Allow matching existing imported transactions up to N days after the expected payment date. Overrides --match-date-window-days when supplied.')
     args = ap.parse_args()
-
+    global MATCH_DATE_WINDOW_BEFORE_DAYS
+    MATCH_DATE_WINDOW_BEFORE_DAYS = max(0, int(args.match_date_window_before_days or 0))
+    after_days = args.match_date_window_after_days
+    args.match_date_window_days = max(0, int(after_days if after_days is not None else args.match_date_window_days))
     book_path = os.path.abspath(args.book)
     if args.apply and not args.allow_non_copy_name and not book_name_is_test_copy(book_path):
         print('Refusing apply: book filename does not look like a copy/test/sandbox file.', file=sys.stderr)
