@@ -9,7 +9,7 @@
 
 declare(strict_types=1);
 
-const APP_VERSION = 'v207u';
+const APP_VERSION = 'v207v';
 const APP_DB = __DIR__ . '/data/review.sqlite';
 const DEFAULT_VENDOR_AMAZON = '000005';
 const DEFAULT_VENDOR_COSTCO = '000001';
@@ -34,6 +34,7 @@ const DEFAULT_STORED_VALUE_ACCOUNT_TRACTOR_SUPPLY = '';
 const DEFAULT_LOWES_PAYMENT_MATCH_DATE_WINDOW_DAYS = '14';
 const DEFAULT_LOWES_PARTIAL_RETURN_MANUAL_STAGE_MIN_AMOUNT = '100.00';
 const DEFAULT_AP_ACCOUNT = 'Liabilities:Accounts Payable';
+const DEFAULT_SCRAPER_YEARS = '';
 
 // Tip/support banner settings.
 // Set GNUCASH_TOOL_SHOW_DONATION_BANNER=0 to hide.
@@ -65,6 +66,7 @@ function default_variable_config_builtin_defaults(): array {
         'DEFAULT_LOWES_PAYMENT_MATCH_DATE_WINDOW_DAYS' => DEFAULT_LOWES_PAYMENT_MATCH_DATE_WINDOW_DAYS,
         'DEFAULT_LOWES_PARTIAL_RETURN_MANUAL_STAGE_MIN_AMOUNT' => DEFAULT_LOWES_PARTIAL_RETURN_MANUAL_STAGE_MIN_AMOUNT,
         'DEFAULT_AP_ACCOUNT' => DEFAULT_AP_ACCOUNT,
+        'DEFAULT_SCRAPER_YEARS' => (DEFAULT_SCRAPER_YEARS !== '' ? DEFAULT_SCRAPER_YEARS : date('Y')),
     ];
 }
 
@@ -214,6 +216,7 @@ function default_variable_config_metadata(): array {
         'DEFAULT_STORED_VALUE_ACCOUNT_TRACTOR_SUPPLY' => ['label'=>'Tractor Supply stored-value/gift-card account', 'group'=>'Payment/stored-value accounts', 'status'=>'Reserved for Tractor Supply gift-card/reward support'],
         'DEFAULT_LOWES_PAYMENT_MATCH_DATE_WINDOW_DAYS' => ['label'=>"Lowe's payment posting-lag tolerance, days", 'group'=>"Lowe's module settings", 'status'=>"Forward-looking window for online-order ship/charge settlement matching in Step 5a"],
         'DEFAULT_LOWES_PARTIAL_RETURN_MANUAL_STAGE_MIN_AMOUNT' => ['label'=>"Lowe's partial-return manual-stage minimum amount", 'group'=>"Lowe's module settings", 'status'=>"Returned lines at or above this amount are staged as reviewable CREDIT memos even when exact refund evidence is not found during import"],
+        'DEFAULT_SCRAPER_YEARS' => ['label'=>'Years to process', 'group'=>'Scraper settings', 'status'=>'Enter years scrapers should process separated by a space, e.g. 2024 2025 2026. Defaults to the current system year.'],
     ];
 }
 function render_donation_banner(string $donationUrl, bool $showDonationBanner): void
@@ -251,6 +254,23 @@ function default_config_value(string $defaultName, ?SQLite3 $db = null): string 
 
 function default_config_values(?SQLite3 $db = null): array {
     return default_variable_config_defaults();
+}
+
+function scraper_years_config(?SQLite3 $db = null): string {
+    $raw = trim((string)default_config_value('DEFAULT_SCRAPER_YEARS', $db));
+    if ($raw === '') $raw = date('Y');
+    preg_match_all('/\b(19\d{2}|20\d{2}|21\d{2})\b/', $raw, $m);
+    $years = [];
+    foreach (($m[1] ?? []) as $year) {
+        $year = (string)$year;
+        if (!isset($years[$year])) $years[$year] = $year;
+    }
+    if (!$years) $years[date('Y')] = date('Y');
+    return implode(' ', array_values($years));
+}
+
+function scraper_years_csv_config(?SQLite3 $db = null): string {
+    return str_replace(' ', ',', scraper_years_config($db));
 }
 
 function lowes_payment_match_date_window_days(?SQLite3 $db = null): int {
@@ -858,6 +878,28 @@ function vendor_payment_hint(array $order): string {
 
 function amazon_payment_hint(array $order): string { return vendor_payment_hint($order); }
 
+function invoice_missing_payment_method_identified(array $order): bool {
+    $payments = trim((string)($order['payments'] ?? ''));
+    if ($payments === '') return true;
+    $p = strtolower($payments);
+    foreach ([
+        'does not include tender',
+        'tender detail not included',
+        'tender details not included',
+        'payment detail not included',
+        'payment details not included',
+        'payment method not identified',
+        'register/tender details not included',
+        'register details not included',
+        'no payment amount detected',
+        'use payment mapping/free-floating scan',
+    ] as $needle) {
+        if (str_contains($p, $needle)) return true;
+    }
+    return false;
+}
+
+
 function stored_value_payment_from_text(string $text, string $vendor): float {
     $text = trim($text);
     if ($text === '') return 0.0;
@@ -1247,7 +1289,7 @@ function connect_app_db(): SQLite3 {
     $colRes = $db->query('PRAGMA table_info(orders)');
     while ($c = $colRes->fetchArray(SQLITE3_ASSOC)) $existingOrderCols[$c['name']] = true;
     if (!isset($existingOrderCols['match_reason'])) $db->exec('ALTER TABLE orders ADD COLUMN match_reason TEXT');
-    if (!isset($existingOrderCols['locked'])) $db->exec('ALTER TABLE orders ADD COLUMN locked INTEGER DEFAULT 0'); if (!isset($existingOrderCols['post_only_invoice'])) $db->exec('ALTER TABLE orders ADD COLUMN post_only_invoice INTEGER DEFAULT 0');
+    if (!isset($existingOrderCols['locked'])) $db->exec('ALTER TABLE orders ADD COLUMN locked INTEGER DEFAULT 0');
     $db->exec('CREATE TABLE IF NOT EXISTS account_rules (
         vendor TEXT NOT NULL,
         match_type TEXT NOT NULL,
@@ -10068,7 +10110,7 @@ sudo systemctl restart php8.5-fpm</textarea>
 </div>
 <div class="card" id="shared-scraper-environment"><h2>Shared scraper environment / refresh all scraped vendors</h2>
 <p class="small">Use one root-level Python virtual environment for all scraper modules. This keeps the directory clean and avoids duplicate dependency installs. Recommended local packages are listed above; in particular, <code>python3-venv</code>, <code>unzip</code>, and <code>php8.5-zip</code> should be present on the PHP-FPM host. The refresh wrapper is intended for periodic monthly/quarterly updates after you launch a normal system Chromium/Chrome browser with remote debugging and log in to each vendor as needed. On Ubuntu 26.04, do not run <code>python -m playwright install chromium</code>; use the already-open browser/CDP workflow.</p>
-<?php $rootQ = escapeshellarg(__DIR__); $sharedInstallCmd = "cd " . $rootQ . "\npython3 -m venv scraper_venv\n. scraper_venv/bin/activate\npip install -U pip\npip install -r lowes_scraper/requirements.txt\npip install -r tractorsupply_scraper/requirements.txt\n"; $sharedRefreshCmd = "cd " . $rootQ . "\n. scraper_venv/bin/activate\npython scrape_all_vendors.py --vendors lowes,tractor_supply --years 2024,2025,2026 --cdp-endpoint http://127.0.0.1:9222\n"; ?>
+<?php $rootQ = escapeshellarg(__DIR__); $scraperYears = scraper_years_config($db); $scraperYearsCsvArg = escapeshellarg(scraper_years_csv_config($db)); $sharedInstallCmd = "cd " . $rootQ . "\npython3 -m venv scraper_venv\n. scraper_venv/bin/activate\npip install -U pip\npip install -r lowes_scraper/requirements.txt\npip install -r tractorsupply_scraper/requirements.txt\n"; $sharedRefreshCmd = "cd " . $rootQ . "\n. scraper_venv/bin/activate\npython scrape_all_vendors.py --vendors lowes,tractor_supply --years " . $scraperYearsCsvArg . " --cdp-endpoint http://127.0.0.1:9222\n"; ?>
 <h3>Install/update shared scraper environment</h3><textarea class="command-box" readonly><?=h($sharedInstallCmd)?></textarea>
 <h3>Refresh all scraped vendors</h3><textarea class="command-box" readonly><?=h($sharedRefreshCmd)?></textarea>
 <p class="small">The wrapper writes per-vendor/per-year normalized folders and ZIPs, for example <code>./lowes_scraper/2026-normalized.zip</code> and <code>./tractorsupply_scraper/2026-normalized.zip</code>. You can still run each vendor scraper individually from that vendor tab.</p>
@@ -10168,6 +10210,8 @@ if (!is_readable(resolve_app_local_path((string)$lastTscPath))) {
     if (!empty($tscCandidates)) $lastTscPath = $tscCandidates[0];
 }
 $rootQ = escapeshellarg($gnu2Root);
+$scraperYears = scraper_years_config($db);
+$scraperYearsCsv = scraper_years_csv_config($db);
 $tscInstallCmd = <<<CMD
 cd {$rootQ}
 python3 -m venv scraper_venv
@@ -10223,16 +10267,18 @@ CMD;
 $tscCaptureCdpCmd = <<<CMD
 cd {$rootQ}
 . scraper_venv/bin/activate
-YEAR=2026
-OUT=./tractorsupply_scraper/\${YEAR}-export
-ZIP=./tractorsupply_scraper/\${YEAR}-normalized.zip
-python tractorsupply_scraper/tsc_extract.py capture-cdp \
-  --years "\$YEAR" \
-  --order-types ONLINE,INSTORE \
-  --cdp-endpoint http://127.0.0.1:9222 \
-  --out "\$OUT" \
-  --zip-out "\$ZIP"
-printf 'ZIP upload path: %s\nDirect folder import path: %s\n' "\$ZIP" "\$OUT/normalized"
+YEARS="{$scraperYears}"
+for YEAR in \$YEARS; do
+  OUT=./tractorsupply_scraper/\${YEAR}-export
+  ZIP=./tractorsupply_scraper/\${YEAR}-normalized.zip
+  python tractorsupply_scraper/tsc_extract.py capture-cdp \\
+    --years "\$YEAR" \\
+    --order-types ONLINE,INSTORE \\
+    --cdp-endpoint http://127.0.0.1:9222 \\
+    --out "\$OUT" \\
+    --zip-out "\$ZIP"
+  printf 'Year %s complete. ZIP upload path: %s\nDirect folder import path: %s\n' "\$YEAR" "\$ZIP" "\$OUT/normalized"
+done
 CMD;
 $tscReparseRawCmd = <<<CMD
 cd {$rootQ}
@@ -10251,7 +10297,7 @@ cd {$rootQ}
 . scraper_venv/bin/activate
 python scrape_all_vendors.py \
   --vendors lowes,tractor_supply \
-  --years 2024,2025,2026 \
+  --years {$scraperYearsCsv} \
   --cdp-endpoint http://127.0.0.1:9222
 CMD;
 ?>
@@ -10275,6 +10321,8 @@ if (!is_readable(resolve_app_local_path((string)$lastLowesPath))) {
 $lowesDefaultZipPath = './lowes_scraper/2026-normalized.zip';
 $lowesDefaultRawPath = './lowes_scraper/2026-export/raw_html';
 $rootQ = escapeshellarg($gnu2Root);
+$scraperYears = scraper_years_config($db);
+$scraperYearsCsv = scraper_years_csv_config($db);
 $lowesInstallCmd = <<<CMD
 # Assumes this tool is installed at: {$gnu2Root}
 cd {$rootQ}
@@ -10298,7 +10346,8 @@ $lowesFullCmd = <<<CMD
 cd {$rootQ}
 . scraper_venv/bin/activate
 
-for YEAR in 2024 2025 2026; do
+YEARS="{$scraperYears}"
+for YEAR in \$YEARS; do
   OUT="{$gnu2Root}/lowes_scraper/\${YEAR}-export"
   NORM="\$OUT/normalized"
   ZIP="{$gnu2Root}/lowes_scraper/\${YEAR}-normalized.zip"
@@ -10394,11 +10443,11 @@ CMD;
 <p class="small">Recommended local layout: keep each year/run under <code>./lowes_scraper/</code>, for example <code>./lowes_scraper/2026-export/normalized</code> and <code>./lowes_scraper/2026-normalized.zip</code>. The web importer can use either path.</p>
 <h3>1. Install/update scraper dependencies</h3>
 <textarea class="command-box" readonly><?=h($lowesInstallCmd)?></textarea>
-<h3>2. Start Chromium with remote debugging and log in to Lowe's</h3>
-<p class="small">Leave this browser running. Log in manually and leave it on or near the Lowe's orders page.</p>
+<h3>2. Open a terminal session and run the below command. This will open a browser window for you to log into Lowe's.</h3>
+<p class="small">Leave this browser running after logging in manually.</p>
 <textarea class="command-box" readonly><?=h($lowesBrowserCmd)?></textarea>
-<h3>3. Full per-year capture, then build one ZIP per year</h3>
-<p class="small">This keeps each year separate so the direct folder importer can use paths such as <code>./lowes_scraper/2026-export/normalized</code>, <code>./lowes_scraper/2025-export/normalized</code>, etc.</p>
+<h3>3. Open a SECOND terminal screen and run the below command to process the specified years.</h3>
+<p class="small">The configured years come from <strong>Config → DEFAULT_SCRAPER_YEARS</strong>. This keeps each year separate so the direct folder importer can use paths such as <code>./lowes_scraper/2026-export/normalized</code>, <code>./lowes_scraper/2025-export/normalized</code>, etc.</p>
 <textarea class="command-box" readonly><?=h($lowesFullCmd)?></textarea>
 <h3>4. Rebuild normalized output from saved raw HTML</h3>
 <p class="small">Use this when raw HTML was already captured and only the parser/importer changed. Edit <code>YEAR=...</code> or <code>RAW=...</code> as needed.</p>
@@ -10737,7 +10786,6 @@ CMD;
     <div class="orderhead">
       <label><input type="checkbox" name="order[<?=h($okey)?>][skip]" <?=((int)$r['skip']?'checked':'')?>> Skip</label>
       <label><input type="checkbox" name="order[<?=h($okey)?>][locked]" <?=((int)($r['locked'] ?? 0)?'checked':'')?>> Lock invoice</label>
-<label title="Experimental: export only invoice-level posting fields, without line items or amounts. Use only to test posting an existing unposted GnuCash bill."><input type="checkbox" name="order[<?=h($orderKey)?>][post_only_invoice]" <?=((int)($r['post_only_invoice'] ?? 0) ? 'checked' : '')?>> Post only invoice</label>
       <button type="submit" name="save_order" value="<?=h($okey)?>" data-anchor="#<?=h(anchor_id('order', (string)$r['vendor'], (string)$r['order_id']))?>" title="Save review edits and stay near this invoice">Save this invoice</button>
       <div class="invoice-actions">
         <label><span class="small">Set all item categories on this invoice</span><br><input list="accounts" type="text" name="order[<?=h($okey)?>][bulk_expense_account]" placeholder="Expenses:..."></label>
@@ -10748,7 +10796,7 @@ CMD;
     </div>
     <?php if($r['items']): ?><div class="small" style="margin:.35rem 0"><?=h(clean_text($r['items']??'',500))?></div><?php endif; ?>
     <?php if($r['warning']): ?><div class="warn" style="margin:.35rem 0"><?=h(dedupe_warning_text((string)$r['warning']))?></div><?php endif; ?>
-    <?php $shipDisplay=(float)$r['shipping']-(float)$r['shipping_refund']; $calcDisplay=round((float)$itSum + $shipDisplay + (float)$r['tax'], 2); $expectedDisplay=order_bill_total_for_validation($r); $deltaDisplay=round($calcDisplay - $expectedDisplay, 2); $vendorPayHint=vendor_payment_hint($r); ?>
+    <?php $shipDisplay=(float)$r['shipping']-(float)$r['shipping_refund']; $calcDisplay=round((float)$itSum + $shipDisplay + (float)$r['tax'], 2); $expectedDisplay=order_bill_total_for_validation($r); $deltaDisplay=round($calcDisplay - $expectedDisplay, 2); $vendorPayHint=vendor_payment_hint($r); $manualPaymentVerify=invoice_missing_payment_method_identified($r); ?>
     <div class="grid4">
       <div><span class="small">Item lines</span><br><?=$itCount?></div>
       <div><span class="small">Item sum</span><br>$<?=fmt_money((float)$itSum)?></div>
@@ -10758,7 +10806,7 @@ CMD;
     <div class="grid3" style="margin-top:.5rem">
       <label>Shipping account<br><span class="small">Shipping $<?=fmt_money((float)$r['shipping']-(float)$r['shipping_refund'])?></span><input list="accounts" type="text" name="order[<?=h($okey)?>][shipping_account]" value="<?=h($r['shipping_account'])?>"></label>
       <label>Sales tax account<br><span class="small">Tax $<?=fmt_money((float)$r['tax'])?></span><input list="accounts" type="text" name="order[<?=h($okey)?>][tax_account]" value="<?=h($r['tax_account'])?>"></label>
-      <label>Order notes<br><span class="small"><?=h($r['payments'])?><?php if($vendorPayHint): ?><br><?=h($vendorPayHint)?><?php endif; ?></span><textarea name="order[<?=h($okey)?>][notes]"><?=h($r['notes'])?></textarea></label>
+      <label>Order notes<br><span class="small"><?=h($r['payments'])?><?php if($vendorPayHint): ?><br><?=h($vendorPayHint)?><?php endif; ?><?php if($manualPaymentVerify): ?><br><strong class="warn">Manually verify payment account!</strong><?php endif; ?></span><textarea name="order[<?=h($okey)?>][notes]"><?=h($r['notes'])?></textarea></label>
     </div>
     <?php if(!$its): ?>
       <div class="grid2" style="margin-top:.5rem">
