@@ -9,7 +9,7 @@
 
 declare(strict_types=1);
 
-const APP_VERSION = 'v207t';
+const APP_VERSION = 'v207u';
 const APP_DB = __DIR__ . '/data/review.sqlite';
 const DEFAULT_VENDOR_AMAZON = '000005';
 const DEFAULT_VENDOR_COSTCO = '000001';
@@ -8153,6 +8153,31 @@ function copy_gnucash_book_for_download(string $sourcePath, string $filename): a
     return [true, $dest];
 }
 
+function render_changed_gnucash_download_section(SQLite3 $db, string $context, string $modeValue = 'transactions', string $paymentStep = 'apply'): string {
+    $context = strtolower(trim($context));
+    if ($context === '') $context = 'changed-book';
+    $contextKey = preg_replace('/[^a-z0-9_]+/', '_', $context);
+    $lastName = get_config($db, 'last_changed_book_download_' . $contextKey, '');
+    $safeMode = h($modeValue);
+    $safeStep = h($paymentStep);
+    $safeContext = h($context);
+    $out = '<div class="card" style="background:#f7fff7;border-color:#9fca9f;margin:.75rem 0" id="download-changed-file-' . h($contextKey) . '">';
+    $out .= '<h4>Download changed file</h4>';
+    $out .= '<p class="small">After changes applied, click this link to download and save your modified file. This creates a downloadable <code>.gnucash</code> copy from the current uploaded working file in <code>data/</code>.</p>';
+    $out .= '<form method="post" style="display:flex;gap:.75rem;align-items:center;flex-wrap:wrap">';
+    $out .= '<input type="hidden" name="action" value="create_current_gnucash_download_copy">';
+    $out .= '<input type="hidden" name="mode" value="' . $safeMode . '">';
+    $out .= '<input type="hidden" name="payment_wizard_step" value="' . $safeStep . '">';
+    $out .= '<input type="hidden" name="download_context" value="' . $safeContext . '">';
+    $out .= '<button type="submit">Create download link for changed file</button>';
+    if ($lastName !== '' && is_file(__DIR__ . '/exports/' . basename($lastName))) {
+        $out .= '<a class="wizard-step ok" href="' . h(make_export_link(basename($lastName))) . '" download>Download last changed file: ' . h(basename($lastName)) . '</a>';
+    }
+    $out .= '</form>';
+    $out .= '</div>';
+    return $out;
+}
+
 function is_export_or_validation_action(string $action): bool {
     $action = strtolower(trim($action));
     return $action === 'export' || $action === 'export_range' || $action === 'validate_export' || str_starts_with($action, 'export_');
@@ -8559,6 +8584,40 @@ if (isset($_GET['date_sort']) || isset($request['date_sort'])) set_config($db, '
 $showSkippedInAll = (string)($_GET['show_skipped'] ?? $request['show_skipped'] ?? get_config($db, 'show_skipped_in_all', '0')) === '1';
 if (isset($_GET['show_skipped']) || isset($request['show_skipped'])) set_config($db, 'show_skipped_in_all', $showSkippedInAll ? '1' : '0');
 $lastPostAction = ($_SERVER['REQUEST_METHOD'] === 'POST') ? strtolower((string)($request['action'] ?? '')) : '';
+if (($request['action'] ?? '') === 'create_current_gnucash_download_copy') {
+    $context = strtolower(trim((string)($request['download_context'] ?? 'changed-book')));
+    if ($context === '') $context = 'changed-book';
+    $contextKey = preg_replace('/[^a-z0-9_]+/', '_', $context);
+    $safePrefix = preg_replace('/[^a-z0-9_.-]+/', '-', $context);
+    if ($safePrefix === '') $safePrefix = 'changed-book';
+
+    $source = realpath((string)$gnucashPath);
+    $dataRoot = realpath(__DIR__ . '/data');
+
+    if ($source === false || !is_file($source) || !is_readable($source)) {
+        $error = 'Could not create changed-file download: selected uploaded GnuCash book is not readable.';
+    } elseif ($dataRoot === false || !path_is_under($source, $dataRoot)) {
+        $error = 'Could not create changed-file download: the selected book is not under the tool data/ directory. Upload/select the working copy in data/ first.';
+    } else {
+        $stamp = date('Ymd-His');
+        $name = gnucash_download_basename($safePrefix . '-changed-file', $stamp);
+        [$ok, $info] = copy_gnucash_book_for_download($source, $name);
+        if ($ok) {
+            set_config($db, 'last_changed_book_download_' . $contextKey, $name);
+            $message = 'Created changed GnuCash file download copy: ' . $name . '.';
+            $exportLinks[] = ['name' => $name, 'batch' => 'Changed uploaded GnuCash working file. Download and validate this modified copy in GnuCash.'];
+        } else {
+            $error = 'Could not create changed-file download: ' . $info;
+        }
+    }
+
+    $mode = in_array((string)($request['mode'] ?? ''), ['transactions','lowes','bills','repair','ledger','sanity','matching'], true) ? (string)$request['mode'] : 'transactions';
+    if (isset($request['payment_wizard_step']) && in_array((string)$request['payment_wizard_step'], ['start','missing','exceptions','ready','apply','credit'], true)) {
+        set_config($db, 'payment_wizard_step', (string)$request['payment_wizard_step']);
+    }
+    set_config($db, 'ui_mode', $mode);
+}
+
 $lowesDryRunDetailHtml = '';
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     if (($request['action'] ?? '') === 'ajax_save') {
@@ -10431,9 +10490,9 @@ CMD;
 <button type="submit">Save match window</button>
 <span class="small">Current search window: <strong><?=h(payment_apply_match_window_label($db))?></strong>.</span>
 </form>
-</div><h4>Dry-run command, match existing only</h4><textarea readonly spellcheck="false" class="command-box small"><?=h($step5DryRunCommand)?></textarea><h4>Apply command, match existing only</h4><textarea readonly spellcheck="false" class="command-box small"><?=h($step5ApplyCommand)?></textarea><ol class="small"><li>Run the dry-run first. The script prints a summary of matched rows, errors, and invoice groups; proceed only when it reports zero errors and says it is ready for apply.</li><li>These commands run against the uploaded <strong>copy</strong> of your primary GnuCash file.</li><li>Once the changes are applied, download the changed copy of your file and validate that all transactions were posted successfully.</li></ol><div class="card" style="background:#fffdf7;border-color:#e0d39c;margin:.75rem 0"><h4>Need to change payment mappings or transaction filters?</h4><p class="small">Use the match-window adjustment above for before/after date tolerance in the generated dry-run/apply commands. If you need to change payment-method mappings, exclusions, imported transaction files, or transaction date filters, return to Step 1, save/rebuild the scan, and return through Step 4 to export a fresh ready-to-apply plan. Step 5 command boxes intentionally use the last exported ready-plan filename.</p><p><a class="wizard-step" href="?mode=transactions&date_sort=<?=urlencode($dateSort)?>&payment_wizard_step=start#payment-wizard">Return to Step 1 — Inputs / mapping</a> <a class="wizard-step" href="?mode=transactions&date_sort=<?=urlencode($dateSort)?>&payment_wizard_step=ready#payment-wizard">Return to Step 4 — Ready plan</a></p></div><p><a class="wizard-step ok" href="?mode=transactions&date_sort=<?=urlencode($dateSort)?>&payment_wizard_step=credit#payment-wizard">Continue to credit/refund matching</a></p><?php endif; ?>
+</div><h4>Dry-run command, match existing only</h4><textarea readonly spellcheck="false" class="command-box small"><?=h($step5DryRunCommand)?></textarea><h4>Apply command, match existing only</h4><textarea readonly spellcheck="false" class="command-box small"><?=h($step5ApplyCommand)?></textarea><?=render_changed_gnucash_download_section($db, 'amazon-step5-payment-apply', 'transactions', 'apply')?><ol class="small"><li>Run the dry-run first. The script prints a summary of matched rows, errors, and invoice groups; proceed only when it reports zero errors and says it is ready for apply.</li><li>These commands run against the uploaded <strong>copy</strong> of your primary GnuCash file.</li><li>Once the changes are applied, download the changed copy of your file and validate that all transactions were posted successfully.</li></ol><div class="card" style="background:#fffdf7;border-color:#e0d39c;margin:.75rem 0"><h4>Need to change payment mappings or transaction filters?</h4><p class="small">Use the match-window adjustment above for before/after date tolerance in the generated dry-run/apply commands. If you need to change payment-method mappings, exclusions, imported transaction files, or transaction date filters, return to Step 1, save/rebuild the scan, and return through Step 4 to export a fresh ready-to-apply plan. Step 5 command boxes intentionally use the last exported ready-plan filename.</p><p><a class="wizard-step" href="?mode=transactions&date_sort=<?=urlencode($dateSort)?>&payment_wizard_step=start#payment-wizard">Return to Step 1 — Inputs / mapping</a> <a class="wizard-step" href="?mode=transactions&date_sort=<?=urlencode($dateSort)?>&payment_wizard_step=ready#payment-wizard">Return to Step 4 — Ready plan</a></p></div><p><a class="wizard-step ok" href="?mode=transactions&date_sort=<?=urlencode($dateSort)?>&payment_wizard_step=credit#payment-wizard">Continue to credit/refund matching</a></p><?php endif; ?>
 <?php elseif($paymentWizardStep==='credit'): ?>
-<h3>Step 6 — CREDIT / refund matching</h3><p>This step is for <code>*-CREDIT</code> vendor credit bills. It does not create gift-card or credit-card refund transactions. First enter/import the refund activity into the appropriate GnuCash account, then run this matcher to attach matched existing refund splits to the credit bill lots.</p><h4>Dry-run command, match existing refunds only</h4><textarea readonly spellcheck="false" class="command-box small"><?=h($step6CreditDryRunCommand)?></textarea><h4>Apply command, match existing refunds only</h4><textarea readonly spellcheck="false" class="command-box small"><?=h($step6CreditApplyCommand)?></textarea><p class="small">In <?=h(APP_VERSION)?> refund matching uses a forward-only six-month window from the credit invoice date. Exact single refund matches are preferred; if none is safe, the script can match a small combination of unapplied refund transactions that sum to the credit amount. If no matching gift-card or credit-card refund transaction exists, the credit remains a review item instead of being auto-created. Run dry-run first and apply only when the summary reports zero errors/blockers.</p>
+<h3>Step 6 — CREDIT / refund matching</h3><p>This step is for <code>*-CREDIT</code> vendor credit bills. It does not create gift-card or credit-card refund transactions. First enter/import the refund activity into the appropriate GnuCash account, then run this matcher to attach matched existing refund splits to the credit bill lots.</p><h4>Dry-run command, match existing refunds only</h4><textarea readonly spellcheck="false" class="command-box small"><?=h($step6CreditDryRunCommand)?></textarea><h4>Apply command, match existing refunds only</h4><textarea readonly spellcheck="false" class="command-box small"><?=h($step6CreditApplyCommand)?></textarea><?=render_changed_gnucash_download_section($db, 'amazon-step6-credit-refund-apply', 'transactions', 'credit')?><p class="small">In <?=h(APP_VERSION)?> refund matching uses a forward-only six-month window from the credit invoice date. Exact single refund matches are preferred; if none is safe, the script can match a small combination of unapplied refund transactions that sum to the credit amount. If no matching gift-card or credit-card refund transaction exists, the credit remains a review item instead of being auto-created. Run dry-run first and apply only when the summary reports zero errors/blockers.</p>
 <?php endif; ?>
 </div>
 <?php if($paymentWizardStep !== 'apply'): ?><div class="card" style="background:#f8fbff;border-color:#8bb7e0"><h3>Payment matching — Amazon transaction history</h3><p class="small">Import the Amazon transaction-history CSV after importing bills. This stores one payment/refund row per Amazon order ID, maps payment methods to GnuCash accounts, and builds a read-only payment application plan from the loaded GnuCash book. It does not modify GnuCash directly.</p><form method="post" enctype="multipart/form-data" style="display:grid;grid-template-columns:auto 1fr auto;gap:.5rem;align-items:end"><input type="hidden" name="action" value="import_amazon_transactions"><input type="hidden" name="mode" value="transactions"><input type="hidden" name="payment_wizard_step" value="start"><label>Amazon transaction history CSV(s)<input type="file" name="amazon_transactions[]" accept=".csv,text/csv" multiple required></label><span class="small">Select one or more CSVs. Expected columns: date, order ids, order urls, vendor, card_details, amount. These files can also be imported from the Import Data tab.</span><button type="submit">Import Amazon payment rows</button></form><form method="post" style="margin-top:.75rem;display:flex;gap:.75rem;align-items:end;flex-wrap:wrap;background:#fffdf7;border:1px solid #e0d39c;padding:.5rem;border-radius:6px"><input type="hidden" name="action" value="save_transaction_match_window"><input type="hidden" name="mode" value="transactions"><label>Payment date start<input type="date" name="payment_match_start_date" value="<?=h($paymentMatchStartDate)?>"></label><label>Payment date end<input type="date" name="payment_match_end_date" value="<?=h($paymentMatchEndDate)?>"></label><button type="submit">Save transaction date window</button><span class="small">Filters transaction matching reports/plans by Amazon payment date. Leave blank for open-ended. Soft reset and re-import to physically drop outside-window rows from the local review database.</span></form><form method="post" style="margin-top:.75rem;display:flex;gap:.75rem;align-items:end;flex-wrap:wrap;background:#f7fff7;border:1px solid #b7d7b7;padding:.5rem;border-radius:6px"><input type="hidden" name="action" value="exclude_payment_target"><input type="hidden" name="mode" value="transactions"><input type="hidden" name="payment_vendor" value="amazon"><label>Exclude order/target from matching<input type="text" name="target_invoice_id" placeholder="112-0190967-2405060" style="min-width:16rem"></label><label>Reason<input type="text" name="exclude_reason" value="Manually handled / out of transaction matching scope" style="min-width:24rem"></label><button type="submit">Add exclusion</button><span class="small"><?=count($paymentTargetExclusions)?> target exclusion(s) saved. Excluded targets are suppressed from exception/apply reports and shown in the excluded/out-of-book report.</span></form><form method="post" style="margin-top:.75rem;display:flex;gap:.75rem;align-items:end;flex-wrap:wrap"><input type="hidden" name="action" value="save_stored_value_import_settings"><input type="hidden" name="mode" value="transactions"><label>Stored-value import offset account<input list="offset_accounts" type="text" name="stored_value_offset_account" value="<?=h($storedValueOffsetAccount)?>" style="min-width:28rem"></label><button type="submit">Save stored-value CSV settings</button><span class="small">Used only for optional GnuCash transaction-import CSVs. Gift Card, Visa/cash-back Rewards, and Prime for Young Adults cash back export as separate files because GnuCash imports one account/register file at a time. Review signs before importing to avoid duplicating later bill-payment application.</span></form><form method="post" style="margin-top:.75rem;display:flex;gap:.75rem;align-items:center;flex-wrap:wrap"><input type="hidden" name="action" value="save_vendor_ledger_diff_settings"><input type="hidden" name="mode" value="transactions"><label style="display:flex;gap:.35rem;align-items:center"><input type="checkbox" name="suppress_zero_vendor_ledger_targets" value="1" <?=($suppressZeroVendorLedgerTargets?'checked':'')?>> Suppress zero-dollar/no-balance ledger targets</label><button type="submit">Save ledger diff settings</button><span class="small">Hides $0.00 Amazon orders/digital/no-charge rows from the active ledger-drift report.</span></form><?php if(!empty($paymentMappings)): ?><form method="post" style="margin-top:.75rem"><input type="hidden" name="action" value="save_payment_mappings"><input type="hidden" name="mode" value="transactions"><strong>Payment method account mapping</strong><table><thead><tr><th>Exclude</th><th>Vendor</th><th>Payment method</th><th>Invoice handling</th><th>GnuCash account</th><th>External expense / clearing account</th></tr></thead><tbody><?php foreach($paymentMappings as $pm): $pmId=(string)$pm['vendor'].'|'.(string)$pm['method_key']; ?><tr><td style="text-align:center"><input type="checkbox" name="pm_excluded[]" value="<?=h($pmId)?>" <?=((int)($pm['excluded'] ?? 0)===1?'checked':'')?>><div class="small">skip</div></td><td><?=h($pm['vendor'])?><input type="hidden" name="pm_vendor[]" value="<?=h($pm['vendor'])?>"><input type="hidden" name="pm_key[]" value="<?=h($pm['method_key'])?>"><input type="hidden" name="pm_name[]" value="<?=h($pm['display_name'])?>"></td><td><?=h($pm['display_name'])?><div class="small"><?=h($pm['method_key'])?></div></td><td><select name="pm_handling[]"><option value="normal" <?=((string)($pm['invoice_handling'] ?? 'normal')==='normal'?'selected':'')?>>Normal: match/pay bill</option><option value="exclude_invoice" <?=((string)($pm['invoice_handling'] ?? '')==='exclude_invoice' || (int)($pm['excluded'] ?? 0)===1?'selected':'')?>>Exclude invoices for this method</option><option value="external_expense" <?=((string)($pm['invoice_handling'] ?? '')==='external_expense'?'selected':'')?>>Keep invoice; map out-of-book</option></select><div class="small">Use exclude for business/out-of-book cards.</div></td><td><input list="payment_accounts" type="text" name="pm_account[]" value="<?=h($pm['account_fullname'])?>" style="width:100%"><div class="small">Payment account for normal methods.</div></td><td><input list="payment_accounts" type="text" name="pm_external_account[]" value="<?=h($pm['external_account'] ?? '')?>" style="width:100%"><div class="small">Optional expense/clearing account for out-of-book handling.</div></td></tr><?php endforeach; ?></tbody></table><button type="submit">Save payment mappings</button></form><?php endif; ?><?php if(!empty($paymentMappings)): ?>
