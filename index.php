@@ -9,7 +9,7 @@
 
 declare(strict_types=1);
 
-const APP_VERSION = 'v207y';
+const APP_VERSION = 'v207z';
 const APP_DB = __DIR__ . '/data/review.sqlite';
 const DEFAULT_VENDOR_AMAZON = '000005';
 const DEFAULT_VENDOR_COSTCO = '000001';
@@ -11118,4 +11118,26 @@ CMD;
 
 
 
+<script>
+document.addEventListener('click', function(ev) {
+  const a = ev.target && ev.target.closest ? ev.target.closest('a[href]') : null;
+  if (!a) return;
+
+  const href = a.getAttribute('href') || '';
+  if (!href.includes('mode=tractor_supply') || !href.includes('vendor_step=scrape')) return;
+
+  // After a local import, the browser may already be on the same URL/hash.
+  // Force a real request by replacing tsc_nav with a click timestamp.
+  ev.preventDefault();
+  ev.stopImmediatePropagation();
+
+  const url = new URL(href, window.location.href);
+  url.searchParams.set('mode', 'tractor_supply');
+  url.searchParams.set('vendor_step', 'scrape');
+  url.searchParams.set('tsc_nav', String(Date.now()));
+  url.hash = 'vendor-tractor-supply-active';
+
+  window.location.assign(url.pathname + url.search + url.hash);
+}, true);
+</script>
 </body></html>
