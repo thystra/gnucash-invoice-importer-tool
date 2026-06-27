@@ -1120,9 +1120,18 @@ def apply_payment_group(book_path: str, target: str, group_rows: List[dict], do_
         con.close()
 
 
-def book_name_is_test_copy(path: str) -> bool:
-    base = os.path.basename(path).lower()
-    return any(tok in base for tok in ['copy', 'test', 'apitest', 'working', 'sandbox'])
+def tool_data_dir() -> str:
+    return os.path.realpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'data'))
+
+
+def book_path_is_under_tool_data_dir(path: str) -> bool:
+    try:
+        data_dir = tool_data_dir()
+        book_real = os.path.realpath(os.path.abspath(path))
+        common = os.path.commonpath([data_dir, book_real])
+        return common == data_dir
+    except Exception:
+        return False
 
 
 def lock_files_for_book(book_path: str) -> List[str]:
@@ -1145,7 +1154,8 @@ def main() -> int:
     mode = ap.add_mutually_exclusive_group(required=True)
     mode.add_argument('--dry-run', action='store_true')
     mode.add_argument('--apply', action='store_true')
-    ap.add_argument('--allow-non-copy-name', action='store_true')
+    ap.add_argument('--allow-non-copy-name', action='store_true', help=argparse.SUPPRESS)
+    ap.add_argument('--allow-non-datadir-file', action='store_true', help='Allow --apply against a book outside this tool\'s data/ directory. Local advanced override only.')
     ap.add_argument('--match-existing', action='store_true', help='Prefer matching/reclassifying existing imported bank/gift-card transactions instead of creating duplicates.')
     ap.add_argument('--no-create-missing', action='store_true', help='When --match-existing is used, fail/skip if an existing transaction is not found instead of creating a new one.')
     ap.add_argument('--match-date-window-days', type=int, default=5,
@@ -1160,9 +1170,10 @@ def main() -> int:
     after_days = args.match_date_window_after_days
     args.match_date_window_days = max(0, int(after_days if after_days is not None else args.match_date_window_days))
     book_path = os.path.abspath(args.book)
-    if args.apply and not args.allow_non_copy_name and not book_name_is_test_copy(book_path):
-        print('Refusing apply: book filename does not look like a copy/test/sandbox file.', file=sys.stderr)
-        print('Rename the copied book with copy/test/apitest/working/sandbox in the filename, or pass --allow-non-copy-name manually.', file=sys.stderr)
+    if args.apply and not args.allow_non_datadir_file and not book_path_is_under_tool_data_dir(book_path):
+        print('Refusing apply: selected GnuCash book is not inside this tool data/ directory.', file=sys.stderr)
+        print('Upload/use the working copy under: ' + tool_data_dir(), file=sys.stderr)
+        print('Advanced local override: pass --allow-non-datadir-file manually.', file=sys.stderr)
         return 4
     if args.apply and not os.access(book_path, os.W_OK):
         print('Refusing apply: selected GnuCash book is not writable by this user.', file=sys.stderr)
@@ -1260,7 +1271,7 @@ def main() -> int:
     if args.dry_run:
         if not error_rows and not skip_rows:
             print('')
-            print('DRY RUN CLEAN: 0 errors and 0 skipped rows. Ready to proceed with the matching --apply command against the same copied/test book and plan.')
+            print('DRY RUN CLEAN: 0 errors and 0 skipped rows. Ready to proceed with the matching --apply command against the same uploaded data/ book copy and plan.')
         elif error_rows:
             print('')
             print('DRY RUN HAS ERRORS: do not apply yet. Review ERROR rows in the result CSV and rerun dry-run after fixing/excluding them.')
