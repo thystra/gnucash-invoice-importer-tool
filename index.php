@@ -9,7 +9,7 @@
 
 declare(strict_types=1);
 
-const APP_VERSION = '1.0.7';
+const APP_VERSION = '1.0.8';
 const APP_DB = __DIR__ . '/data/review.sqlite';
 const DEFAULT_VENDOR_AMAZON = '000005';
 const DEFAULT_VENDOR_COSTCO = '000001';
@@ -1417,6 +1417,9 @@ function connect_app_db(): SQLite3 {
     if (!isset($existingCols['source_amount'])) $db->exec('ALTER TABLE order_items ADD COLUMN source_amount REAL DEFAULT NULL');
     if (!isset($existingCols['account_change_source'])) $db->exec("ALTER TABLE order_items ADD COLUMN account_change_source TEXT DEFAULT ''");
     if (!isset($existingCols['account_last_changed_at'])) $db->exec("ALTER TABLE order_items ADD COLUMN account_last_changed_at TEXT DEFAULT ''");
+    if (!isset($existingCols['skip_taxable'])) $db->exec('ALTER TABLE order_items ADD COLUMN skip_taxable INTEGER DEFAULT 1');
+    if (!isset($existingCols['skip_tax_rate'])) $db->exec('ALTER TABLE order_items ADD COLUMN skip_tax_rate REAL DEFAULT NULL');
+    if (!isset($existingCols['skip_tax_confirmed'])) $db->exec('ALTER TABLE order_items ADD COLUMN skip_tax_confirmed INTEGER DEFAULT 0');
     $existingOrderCols = [];
     $colRes = $db->query('PRAGMA table_info(orders)');
     while ($c = $colRes->fetchArray(SQLITE3_ASSOC)) $existingOrderCols[$c['name']] = true;
@@ -5246,6 +5249,115 @@ function invalid_accounts_for_missing_credit_memo_targets(SQLite3 $db, string $v
     return invalid_account_review_rows(missing_credit_memo_account_review_rows($db, $vendor, $gnucashPath), $validAccounts);
 }
 
+function review_skip_tax_default_rate_percent(SQLite3 $db): float {
+    $raw = trim((string)get_config($db, 'review_skip_tax_default_rate_percent', '7.5'));
+    if ($raw === '' || !is_numeric($raw)) return 7.5;
+    return max(0.0, min(25.0, round((float)$raw, 4)));
+}
+
+function item_line_amount_for_review(array $it): float {
+    if (array_key_exists('source_amount', $it) && $it['source_amount'] !== null && trim((string)$it['source_amount']) !== '') {
+        return round((float)$it['source_amount'], 2);
+    }
+    $qty = (float)($it['quantity'] ?? 1.0);
+    if (abs($qty) < 0.0001) $qty = 1.0;
+    return round($qty * (float)($it['unit_price'] ?? 0.0), 2);
+}
+
+function skipped_item_tax_summary(SQLite3 $db, string $vendor, string $orderId): array {
+    $vendor = strtolower(trim($vendor));
+    $orderId = trim($orderId);
+    $defaultRate = review_skip_tax_default_rate_percent($db);
+    $out = [
+        'skipped_count' => 0,
+        'unconfirmed_count' => 0,
+        'skipped_subtotal' => 0.0,
+        'confirmed_taxable_subtotal' => 0.0,
+        'confirmed_tax_adjustment' => 0.0,
+        'preview_tax_adjustment' => 0.0,
+        'default_rate' => $defaultRate,
+    ];
+    if ($vendor === '' || $orderId === '') return $out;
+
+    $stmt = $db->prepare('SELECT vendor, order_id, item_key, quantity, unit_price, source_amount, skip_taxable, skip_tax_rate, skip_tax_confirmed
+                           FROM order_items
+                           WHERE vendor=:vendor AND order_id=:order_id AND skip<>0');
+    $stmt->bindValue(':vendor', $vendor, SQLITE3_TEXT);
+    $stmt->bindValue(':order_id', $orderId, SQLITE3_TEXT);
+    $res = $stmt->execute();
+    while ($it = $res->fetchArray(SQLITE3_ASSOC)) {
+        $line = item_line_amount_for_review($it);
+        $rate = ($it['skip_tax_rate'] !== null && trim((string)$it['skip_tax_rate']) !== '') ? (float)$it['skip_tax_rate'] : $defaultRate;
+        $rate = max(0.0, min(25.0, $rate));
+        $isTaxable = (int)($it['skip_taxable'] ?? 1) !== 0;
+        $confirmed = (int)($it['skip_tax_confirmed'] ?? 0) !== 0;
+        $lineTax = $isTaxable ? round(abs($line) * $rate / 100.0, 2) : 0.0;
+
+        $out['skipped_count']++;
+        $out['skipped_subtotal'] = round((float)$out['skipped_subtotal'] + $line, 2);
+        $out['preview_tax_adjustment'] = round((float)$out['preview_tax_adjustment'] + $lineTax, 2);
+        if (!$confirmed) $out['unconfirmed_count']++;
+        if ($confirmed) {
+            if ($isTaxable) $out['confirmed_taxable_subtotal'] = round((float)$out['confirmed_taxable_subtotal'] + $line, 2);
+            $out['confirmed_tax_adjustment'] = round((float)$out['confirmed_tax_adjustment'] + $lineTax, 2);
+        }
+    }
+    return $out;
+}
+
+function order_export_tax_amount(SQLite3 $db, array $order): float {
+    $tax = round((float)($order['tax'] ?? 0.0), 2);
+    if ($tax <= 0.005) return $tax;
+    $summary = skipped_item_tax_summary($db, (string)($order['vendor'] ?? ''), (string)($order['order_id'] ?? ''));
+    $adj = max(0.0, round((float)($summary['confirmed_tax_adjustment'] ?? 0.0), 2));
+    if ($adj <= 0.005) return $tax;
+    return round(max(0.0, $tax - min($tax, $adj)), 2);
+}
+
+function render_skipped_item_tax_controls_html(SQLite3 $db, array $it, string $ikey): string {
+    if ((int)($it['skip'] ?? 0) === 0) return '';
+    $defaultRate = review_skip_tax_default_rate_percent($db);
+    $rateRaw = trim((string)($it['skip_tax_rate'] ?? ''));
+    $rate = $rateRaw !== '' ? (float)$rateRaw : $defaultRate;
+    $line = item_line_amount_for_review($it);
+    $isTaxable = (int)($it['skip_taxable'] ?? 1) !== 0;
+    $confirmed = (int)($it['skip_tax_confirmed'] ?? 0) !== 0;
+    $estTax = $isTaxable ? round(abs($line) * $rate / 100.0, 2) : 0.0;
+
+    $html = '<div class="small" style="margin-top:.35rem;background:#fff8dc;border:1px solid #d6b656;border-radius:4px;padding:.35rem">';
+    $html .= '<strong>Skipped-line tax validation</strong><br>';
+    $html .= '<label><input type="checkbox" name="item[' . h($ikey) . '][skip_taxable]" value="1" ' . ($isTaxable ? 'checked' : '') . '> taxable to excluded/other entity</label> ';
+    $html .= '<label>tax rate % <input type="text" name="item[' . h($ikey) . '][skip_tax_rate]" value="' . h((string)$rate) . '" style="width:5rem"></label> ';
+    $html .= '<label><input type="checkbox" name="item[' . h($ikey) . '][skip_tax_confirmed]" value="1" ' . ($confirmed ? 'checked' : '') . '> confirm</label>';
+    $html .= '<br>Skipped line $' . h(fmt_money($line)) . '; estimated skipped tax $' . h(fmt_money($estTax)) . '. Confirmed taxable skipped lines reduce the exported sales tax line.';
+    $html .= '</div>';
+    return $html;
+}
+
+function render_skipped_line_tax_validation_html(SQLite3 $db, string $vendor, string $orderId, array $summary, float $fullTax, float $exportTax, float $expectedFullTotal, float $exportCalcTotal): string {
+    if ((int)($summary['skipped_count'] ?? 0) === 0) return '';
+    $defaultRate = review_skip_tax_default_rate_percent($db);
+    $expectedAdjusted = round($expectedFullTotal - (float)$summary['skipped_subtotal'] - (float)$summary['confirmed_tax_adjustment'], 2);
+    $html = '<div class="card" style="background:#fff8dc;border-color:#d6b656;margin:.65rem 0">';
+    $html .= '<h4>Skipped line / tax validation</h4>';
+    $html .= '<p class="small">Use this when individual lines are manually skipped because they belong to another entity, reimbursement, or other non-exported portion of the vendor receipt. Confirm whether each skipped line is taxable. Confirmed taxable skipped lines reduce the exported sales tax amount; unconfirmed skipped lines block validation so the total delta is not hidden accidentally.</p>';
+    $html .= '<div style="display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:.5rem">';
+    $html .= '<div><span class="small">Skipped lines</span><br>' . h((string)$summary['skipped_count']) . '</div>';
+    $html .= '<div><span class="small">Skipped subtotal</span><br>$' . h(fmt_money((float)$summary['skipped_subtotal'])) . '</div>';
+    $html .= '<div><span class="small">Confirmed skipped tax</span><br>$' . h(fmt_money((float)$summary['confirmed_tax_adjustment'])) . '</div>';
+    $html .= '<div><span class="small">Export sales tax</span><br>$' . h(fmt_money($exportTax)) . ' <span class="small">of $' . h(fmt_money($fullTax)) . '</span></div>';
+    $html .= '<div><span class="small">Export calc total</span><br>$' . h(fmt_money($exportCalcTotal)) . '</div>';
+    $html .= '</div>';
+    if ((int)$summary['unconfirmed_count'] > 0) {
+        $html .= '<p class="warn">' . h((string)$summary['unconfirmed_count']) . ' skipped line(s) still need taxable/non-taxable confirmation before validation/export should be trusted.</p>';
+    } else {
+        $html .= '<p class="small"><strong>Adjusted expected export total:</strong> $' . h(fmt_money($expectedAdjusted)) . ' = vendor total $' . h(fmt_money($expectedFullTotal)) . ' - skipped subtotal $' . h(fmt_money((float)$summary['skipped_subtotal'])) . ' - confirmed skipped tax $' . h(fmt_money((float)$summary['confirmed_tax_adjustment'])) . '.</p>';
+    }
+    $html .= '<label class="small">Default sales tax rate for newly skipped taxable lines (%) <input type="text" name="review_skip_tax_default_rate" value="' . h((string)$defaultRate) . '" style="width:6rem"></label>';
+    $html .= '</div>';
+    return $html;
+}
+
 function export_gnucash_bill_csv_for_targets(SQLite3 $db, string $outPath, array $targets, bool $withHeader = false, string $accountPrefix = '', bool $postInvoices = false, string $postingAccount = '', string $postDateFormat = 'mdy_slash', bool $includeSkipped = false): int {
     if (trim($postingAccount) === '') $postingAccount = default_config_value('DEFAULT_AP_ACCOUNT', $db);
     $want = [];
@@ -5281,7 +5393,7 @@ function export_gnucash_bill_csv_for_targets(SQLite3 $db, string $outPath, array
         $shipAcct = export_account_name($r['shipping_account'] ?: default_config_value('DEFAULT_SHIPPING_ACCOUNT'), $accountPrefix);
         if (abs($shippingCharge) > 0.0001) { fputcsv($fh, [$id,$exportDate,$vendor_id,$billing,$notes,$exportDate,'Shipping','',$shipAcct,'1',fmt_money($shippingCharge),'','','','N','N','',$datePosted,$dueDate,$acctPosted,$memoPosted,'N']); $n++; }
         if (abs($shippingRefund) > 0.0001) { fputcsv($fh, [$id,$exportDate,$vendor_id,$billing,$notes,$exportDate,'Free Shipping / Shipping promotion','',$shipAcct,'1',fmt_money(-abs($shippingRefund)),'','','','N','N','',$datePosted,$dueDate,$acctPosted,$memoPosted,'N']); $n++; }
-        $tax = (float)$r['tax'];
+        $tax = order_export_tax_amount($db, $r);
         if (abs($tax) > 0.0001) { $acct = export_account_name($r['tax_account'] ?: default_config_value('DEFAULT_TAX_ACCOUNT'), $accountPrefix); fputcsv($fh, [$id,$exportDate,$vendor_id,$billing,$notes,$exportDate,'Sales tax','',$acct,'1',fmt_money($tax),'','','','N','N','',$datePosted,$dueDate,$acctPosted,$memoPosted,'N']); $n++; }
     }
     fclose($fh); return $n;
@@ -8422,6 +8534,12 @@ function set_invoice_items_category(SQLite3 $db, string $vendor, string $order_i
 }
 
 function save_review_edits(SQLite3 $db, array $post): void {
+    if (array_key_exists('review_skip_tax_default_rate', $post)) {
+        $rate = trim((string)($post['review_skip_tax_default_rate'] ?? ''));
+        if ($rate === '' || !is_numeric($rate)) $rate = '7.5';
+        $rate = (string)max(0.0, min(25.0, round((float)$rate, 4)));
+        set_config($db, 'review_skip_tax_default_rate_percent', $rate);
+    }
     $last = null;
     for ($attempt = 1; $attempt <= 5; $attempt++) {
         try {
@@ -8442,9 +8560,17 @@ function save_review_edits(SQLite3 $db, array $post): void {
                     $oldAcct = trim((string)($oldRow['expense_account'] ?? ''));
                     $newAcct = trim((string)($data['expense_account'] ?? ''));
                     $manualChanged = ($newAcct !== $oldAcct);
-                    $stmt = $db->prepare('UPDATE order_items SET expense_account=:expense, unit_price=:unit_price, skip=:skip, locked=:locked, notes=:notes, account_change_source=CASE WHEN :manual_changed=1 THEN "manual" ELSE account_change_source END, account_last_changed_at=CASE WHEN :manual_changed=1 THEN :changed_at ELSE account_last_changed_at END WHERE vendor=:vendor AND order_id=:order_id AND item_key=:item_key');
-                    $stmt->bindValue(':expense', $newAcct, SQLITE3_TEXT); $stmt->bindValue(':unit_price', money_to_float($data['unit_price'] ?? '0'), SQLITE3_FLOAT); $stmt->bindValue(':skip', isset($data['skip']) ? 1 : 0, SQLITE3_INTEGER);
-                    $stmt->bindValue(':locked', isset($data['locked']) ? 1 : 0, SQLITE3_INTEGER); $stmt->bindValue(':notes', $data['notes'] ?? '', SQLITE3_TEXT); $stmt->bindValue(':manual_changed', $manualChanged ? 1 : 0, SQLITE3_INTEGER); $stmt->bindValue(':changed_at', now_sql(), SQLITE3_TEXT); $stmt->bindValue(':vendor', $vendor, SQLITE3_TEXT); $stmt->bindValue(':order_id', $order_id, SQLITE3_TEXT); $stmt->bindValue(':item_key', $item_key, SQLITE3_TEXT); $stmt->execute();
+                    $stmt = $db->prepare('UPDATE order_items SET expense_account=:expense, unit_price=:unit_price, skip=:skip, locked=:locked, notes=:notes, skip_taxable=:skip_taxable, skip_tax_rate=:skip_tax_rate, skip_tax_confirmed=:skip_tax_confirmed, account_change_source=CASE WHEN :manual_changed=1 THEN "manual" ELSE account_change_source END, account_last_changed_at=CASE WHEN :manual_changed=1 THEN :changed_at ELSE account_last_changed_at END WHERE vendor=:vendor AND order_id=:order_id AND item_key=:item_key');
+                    $skipNow = isset($data['skip']) ? 1 : 0;
+                    $skipTaxable = isset($data['skip_taxable']) ? 1 : ($skipNow ? 1 : 0);
+                    $skipTaxConfirmed = isset($data['skip_tax_confirmed']) ? 1 : 0;
+                    $skipTaxRateRaw = trim((string)($data['skip_tax_rate'] ?? ''));
+                    $stmt->bindValue(':expense', $newAcct, SQLITE3_TEXT); $stmt->bindValue(':unit_price', money_to_float($data['unit_price'] ?? '0'), SQLITE3_FLOAT); $stmt->bindValue(':skip', $skipNow, SQLITE3_INTEGER);
+                    $stmt->bindValue(':locked', isset($data['locked']) ? 1 : 0, SQLITE3_INTEGER); $stmt->bindValue(':notes', $data['notes'] ?? '', SQLITE3_TEXT);
+                    $stmt->bindValue(':skip_taxable', $skipTaxable, SQLITE3_INTEGER);
+                    if ($skipTaxRateRaw === '') $stmt->bindValue(':skip_tax_rate', null, SQLITE3_NULL); else $stmt->bindValue(':skip_tax_rate', max(0.0, min(25.0, (float)$skipTaxRateRaw)), SQLITE3_FLOAT);
+                    $stmt->bindValue(':skip_tax_confirmed', $skipTaxConfirmed, SQLITE3_INTEGER);
+                    $stmt->bindValue(':manual_changed', $manualChanged ? 1 : 0, SQLITE3_INTEGER); $stmt->bindValue(':changed_at', now_sql(), SQLITE3_TEXT); $stmt->bindValue(':vendor', $vendor, SQLITE3_TEXT); $stmt->bindValue(':order_id', $order_id, SQLITE3_TEXT); $stmt->bindValue(':item_key', $item_key, SQLITE3_TEXT); $stmt->execute();
                     $acct = $newAcct;
                     if ($manualChanged && $vendor !== 'lowes' && $acct !== '' && str_starts_with($acct, 'Expenses:') && !is_placeholder_account($acct)) {
                         $lookup = $db->prepare('SELECT asin, description, notes FROM order_items WHERE vendor=:vendor AND order_id=:order_id AND item_key=:item_key');
@@ -8765,13 +8891,27 @@ function validate_export_ready(SQLite3 $db, array $accounts, string $gnucashPath
         if($itemCount===0) $check((string)$r['expense_account'], ['vendor'=>$vendor,'order_id'=>$id,'type'=>'fallback','label'=>$vendor.' '.$id.' fallback item line']);
         $ship=(float)$r['shipping']-(float)$r['shipping_refund'];
         if($ship>0.0001) $check((string)$r['shipping_account'], ['vendor'=>$vendor,'order_id'=>$id,'type'=>'shipping','label'=>$vendor.' '.$id.' shipping']);
-        $tax=(float)$r['tax'];
+        $skipTaxSummary = skipped_item_tax_summary($db, $vendor, $id);
+        $tax = order_export_tax_amount($db, $r);
         if(abs($tax)>0.0001) $check((string)$r['tax_account'], ['vendor'=>$vendor,'order_id'=>$id,'type'=>'tax','label'=>$vendor.' '.$id.' sales tax']);
         $itemSum = (float)$db->querySingle("SELECT COALESCE(SUM(CASE WHEN vendor IN ('costco','walmart') AND source_amount IS NOT NULL THEN source_amount ELSE quantity*unit_price END),0) FROM order_items WHERE vendor='".SQLite3::escapeString($vendor)."' AND order_id='".SQLite3::escapeString($id)."' AND skip=0");
         if ($itemCount === 0) $itemSum = (float)$r['item_amount'];
         $calcTotal = round($itemSum + $ship + $tax, 2);
         $reportedTotal = order_bill_total_for_validation($r);
-        if (abs($calcTotal - $reportedTotal) > 0.01) {
+        if ((int)($skipTaxSummary['skipped_count'] ?? 0) > 0) {
+            if ((int)($skipTaxSummary['unconfirmed_count'] ?? 0) > 0) {
+                $msg = $vendor.' '.$id.' has '.(int)$skipTaxSummary['skipped_count'].' skipped line(s), but '.(int)$skipTaxSummary['unconfirmed_count'].' still need skipped-line tax validation. Confirm taxable/non-taxable treatment before export.';
+                $errors[] = $msg;
+                $invalid['(skipped line tax validation)'][] = ['vendor'=>$vendor,'order_id'=>$id,'type'=>'skipped_line_tax_validation','label'=>$msg];
+            } else {
+                $expectedAdjusted = round($reportedTotal - (float)$skipTaxSummary['skipped_subtotal'] - (float)$skipTaxSummary['confirmed_tax_adjustment'], 2);
+                if (abs($calcTotal - $expectedAdjusted) > 0.01) {
+                    $msg = $vendor.' '.$id.' adjusted skipped-line total mismatch: exported item lines $'.fmt_money($itemSum).' + shipping $'.fmt_money($ship).' + adjusted tax $'.fmt_money($tax).' = $'.fmt_money($calcTotal).', but adjusted expected export total is $'.fmt_money($expectedAdjusted).' after skipped subtotal $'.fmt_money((float)$skipTaxSummary['skipped_subtotal']).' and skipped tax $'.fmt_money((float)$skipTaxSummary['confirmed_tax_adjustment']).'.';
+                    $errors[] = $msg;
+                    $invalid['(total mismatch)'][] = ['vendor'=>$vendor,'order_id'=>$id,'type'=>'total_mismatch','label'=>$msg];
+                }
+            }
+        } elseif (abs($calcTotal - $reportedTotal) > 0.01) {
             $msg = $vendor.' '.$id.' total mismatch: item lines $'.fmt_money($itemSum).' + shipping $'.fmt_money($ship).' + tax $'.fmt_money($tax).' = $'.fmt_money($calcTotal).', but expected bill/vendor total is $'.fmt_money($reportedTotal).'.';
             $errors[] = $msg;
             $invalid['(total mismatch)'][] = [
@@ -8842,7 +8982,7 @@ function export_gnucash_bill_csv(SQLite3 $db, string $outPath, bool $withHeader 
         $shipAcct = export_account_name($r['shipping_account'] ?: default_config_value('DEFAULT_SHIPPING_ACCOUNT'), $accountPrefix);
         if (abs($shippingCharge) > 0.0001) { fputcsv($fh, [$id,$exportDate,$vendor_id,$billing,$notes,$exportDate,'Shipping','',$shipAcct,'1',fmt_money($shippingCharge),'','','','N','N','',$datePosted,$dueDate,$acctPosted,$memoPosted,'N']); $n++; }
         if (abs($shippingRefund) > 0.0001) { fputcsv($fh, [$id,$exportDate,$vendor_id,$billing,$notes,$exportDate,'Free Shipping / Shipping promotion','',$shipAcct,'1',fmt_money(-abs($shippingRefund)),'','','','N','N','',$datePosted,$dueDate,$acctPosted,$memoPosted,'N']); $n++; }
-        $tax = (float)$r['tax'];
+        $tax = order_export_tax_amount($db, $r);
         if (abs($tax) > 0.0001) { $acct = export_account_name($r['tax_account'] ?: default_config_value('DEFAULT_TAX_ACCOUNT'), $accountPrefix); fputcsv($fh, [$id,$exportDate,$vendor_id,$billing,$notes,$exportDate,'Sales tax','',$acct,'1',fmt_money($tax),'','','','N','N','',$datePosted,$dueDate,$acctPosted,$memoPosted,'N']); $n++; }
     }
     fclose($fh); return $n;
@@ -11117,7 +11257,7 @@ CMD;
 <div id="review-top" class="resize-help">Tip: drag the right edge of an item-table column header to resize columns. Double-click a resize handle to reset the item columns. Widths are saved in this browser. Use <strong>Apply same SKU/ASIN</strong> to force the selected category onto all unlocked exact matching SKU/ASIN rows; it also updates pending rows with the same normalized product title. Discount/reconciliation rows are exempt from global SKU/ASIN propagation and instead follow a categorized item in their own invoice, defaulting to the highest-value item when ambiguous. Use the invoice header controls to save while staying near that invoice, or to set every item line on that invoice to one category without creating global product rules. Use <strong>Use invoice as category reference</strong> to propagate all categorized SKUs/ASINs from that invoice. Use <strong>Apply changed categories since last bulk apply</strong> after manually changing several account fields; it will train rules from those edits and fill blank/Uncategorized matching rows. Locked rows are not changed by automatic propagation.</div>
 <div class="category-legend small"><span class="category-chip"><span class="category-swatch uncat"></span>Needs category / Expenses:Uncategorized</span><span class="category-chip"><span class="category-swatch cat"></span>Reviewed valid category</span><span class="category-chip"><span class="category-swatch invalid"></span>Non-empty but not in loaded account list</span></div>
 <div class="small" style="margin:.5rem 0">Debug: this page has <?=count($orders)?> orders selected after pagination. Item counts for first orders: <?php $dbg=[]; foreach(array_slice($orders,0,8) as $dr){$dk=$dr['vendor'].'|'.$dr['order_id']; $dbg[]=$dr['order_id'].':'.count($items[$dk]??[]);} echo h(implode(', ', $dbg)); ?></div>
-<?php foreach($orders as $r): $okey=$r['vendor'].'|'.$r['order_id']; $its=$items[$okey]??[]; $itSum=$itemTotals[$okey]['sum']??0; $itCount=$itemTotals[$okey]['count']??0; ?>
+<?php foreach($orders as $r): $okey=$r['vendor'].'|'.$r['order_id']; $its=$items[$okey]??[]; $itSum=$itemTotals[$okey]['sum']??0; $itCount=$itemTotals[$okey]['count']??0; $skipTaxSummary=skipped_item_tax_summary($db, (string)$r['vendor'], (string)$r['order_id']); $displayTax=order_export_tax_amount($db, $r); ?>
   <div class="ordercard" id="<?=h(anchor_id('order', (string)$r['vendor'], (string)$r['order_id']))?>">
     <div class="orderhead">
       <label><input type="checkbox" name="order[<?=h($okey)?>][skip]" <?=((int)$r['skip']?'checked':'')?>> Skip</label>
@@ -11132,7 +11272,7 @@ CMD;
     </div>
     <?php if($r['items']): ?><div class="small" style="margin:.35rem 0"><?=h(clean_text($r['items']??'',500))?></div><?php endif; ?>
     <?php if($r['warning']): ?><div class="warn" style="margin:.35rem 0"><?=h(dedupe_warning_text((string)$r['warning']))?></div><?php endif; ?>
-    <?php $shipDisplay=(float)$r['shipping']-(float)$r['shipping_refund']; $calcDisplay=round((float)$itSum + $shipDisplay + (float)$r['tax'], 2); $expectedDisplay=order_bill_total_for_validation($r); $deltaDisplay=round($calcDisplay - $expectedDisplay, 2); $vendorPayHint=vendor_payment_hint($r); $manualPaymentVerify=invoice_missing_payment_method_identified($r); ?>
+    <?php $shipDisplay=(float)$r['shipping']-(float)$r['shipping_refund']; $calcDisplay=round((float)$itSum + $shipDisplay + (float)$displayTax, 2); $expectedDisplay=order_bill_total_for_validation($r); $skipAdjustedExpectedDisplay=round($expectedDisplay - (float)$skipTaxSummary['skipped_subtotal'] - (float)$skipTaxSummary['confirmed_tax_adjustment'], 2); $compareExpectedDisplay=((int)$skipTaxSummary['skipped_count']>0 && (int)$skipTaxSummary['unconfirmed_count']===0) ? $skipAdjustedExpectedDisplay : $expectedDisplay; $deltaDisplay=round($calcDisplay - $compareExpectedDisplay, 2); $vendorPayHint=vendor_payment_hint($r); $manualPaymentVerify=invoice_missing_payment_method_identified($r); ?>
     <div class="grid4">
       <div><span class="small">Item lines</span><br><?=$itCount?></div>
       <div><span class="small">Item sum</span><br>$<?=fmt_money((float)$itSum)?></div>
@@ -11141,9 +11281,10 @@ CMD;
     </div>
     <div class="grid3" style="margin-top:.5rem">
       <label>Shipping account<br><span class="small">Shipping $<?=fmt_money((float)$r['shipping']-(float)$r['shipping_refund'])?></span><input list="accounts" type="text" name="order[<?=h($okey)?>][shipping_account]" value="<?=h($r['shipping_account'])?>"></label>
-      <label>Sales tax account<br><span class="small">Tax $<?=fmt_money((float)$r['tax'])?></span><input list="accounts" type="text" name="order[<?=h($okey)?>][tax_account]" value="<?=h($r['tax_account'])?>"></label>
+      <label>Sales tax account<br><span class="small">Tax $<?=fmt_money((float)$r['tax'])?><?php if(abs((float)$displayTax - (float)$r['tax'])>0.005): ?><br>Export tax after skipped-line adjustment $<?=fmt_money((float)$displayTax)?><?php endif; ?></span><input list="accounts" type="text" name="order[<?=h($okey)?>][tax_account]" value="<?=h($r['tax_account'])?>"></label>
       <label>Order notes<br><span class="small"><?=h($r['payments'])?><?php if($vendorPayHint): ?><br><?=h($vendorPayHint)?><?php endif; ?><?php if($manualPaymentVerify): ?><br><strong class="warn">Manually verify payment account!</strong><?php endif; ?></span><textarea name="order[<?=h($okey)?>][notes]"><?=h($r['notes'])?></textarea></label>
     </div>
+    <?=render_skipped_line_tax_validation_html($db, (string)$r['vendor'], (string)$r['order_id'], $skipTaxSummary, (float)$r['tax'], (float)$displayTax, (float)$expectedDisplay, (float)$calcDisplay)?>
     <?php if(!$its): ?>
       <div class="grid2" style="margin-top:.5rem">
         <label>Fallback expense account<input list="accounts" type="text" name="order[<?=h($okey)?>][expense_account]" value="<?=h($r['expense_account'])?>"></label>
@@ -11164,7 +11305,7 @@ CMD;
         <tr class="<?=h($itemRowClass)?>" id="<?=h(anchor_id('item', (string)$it['vendor'], (string)$it['order_id'], (string)$it['item_key']))?>">
           <td><input type="checkbox" name="item[<?=h($ikey)?>][skip]" <?=((int)$it['skip']?'checked':'')?>></td>
           <td><input type="checkbox" name="item[<?=h($ikey)?>][locked]" <?=((int)($it['locked'] ?? 0)?'checked':'')?> title="Lock this row so future auto-categorization does not change it"></td>
-          <td><?=h(clean_text($it['description']??'',420))?><br><span class="small"><?=h(vendor_config((string)$it['vendor'])['product_key_label'])?> <?=h($it['asin'])?> <?php if($it['match_reason']): ?> | <?=h($it['match_reason'])?><?php endif; ?> <?php $displayItemUrl=item_display_url((string)$it['vendor'], (string)($it['item_url'] ?? ''), (string)($it['description'] ?? ''), (string)($it['asin'] ?? '')); if($displayItemUrl): ?>| <a href="<?=h($displayItemUrl)?>" target="_blank" rel="noopener noreferrer">item</a><?php endif; ?></span><?php if(is_credit_memo_row($it)): $creditOpts=credit_return_item_options($db, (string)$it['vendor'], (string)$it['order_id']); if($creditOpts): ?><div class="small" style="margin-top:.35rem"><strong>Returned item(s):</strong><br><?php $selectedCreditKeys = credit_selected_item_keys($it); ?><select name="credit_return_items[<?=h($ikey)?>][]" multiple size="<?=min(6,max(3,count($creditOpts)))?>" style="width:100%"><?php foreach($creditOpts as $co): ?><option value="<?=h($co['item_key'])?>" <?=in_array((string)$co['item_key'], $selectedCreditKeys, true)?'selected':''?>><?=h('$'.fmt_money((float)$co['amount']).' — '.clean_text((string)$co['description'], 120).' — '.(string)$co['expense_account'])?></option><?php endforeach; ?></select><br><button type="submit" name="save_credit_return_items" value="<?=h($ikey)?>" data-anchor="#<?=h(anchor_id('item', (string)$it['vendor'], (string)$it['order_id'], (string)$it['item_key']))?>" style="margin-top:.25rem">Save returned item selection</button><br><span class="small">Select one or more returned original-order lines, then click <strong>Save returned item selection</strong>. The credit memo description/category will be rebuilt from the selection.</span></div><?php endif; endif; ?></td>
+          <td><?=h(clean_text($it['description']??'',420))?><br><span class="small"><?=h(vendor_config((string)$it['vendor'])['product_key_label'])?> <?=h($it['asin'])?> <?php if($it['match_reason']): ?> | <?=h($it['match_reason'])?><?php endif; ?> <?php $displayItemUrl=item_display_url((string)$it['vendor'], (string)($it['item_url'] ?? ''), (string)($it['description'] ?? ''), (string)($it['asin'] ?? '')); if($displayItemUrl): ?>| <a href="<?=h($displayItemUrl)?>" target="_blank" rel="noopener noreferrer">item</a><?php endif; ?></span><?=render_skipped_item_tax_controls_html($db, $it, $ikey)?><?php if(is_credit_memo_row($it)): $creditOpts=credit_return_item_options($db, (string)$it['vendor'], (string)$it['order_id']); if($creditOpts): ?><div class="small" style="margin-top:.35rem"><strong>Returned item(s):</strong><br><?php $selectedCreditKeys = credit_selected_item_keys($it); ?><select name="credit_return_items[<?=h($ikey)?>][]" multiple size="<?=min(6,max(3,count($creditOpts)))?>" style="width:100%"><?php foreach($creditOpts as $co): ?><option value="<?=h($co['item_key'])?>" <?=in_array((string)$co['item_key'], $selectedCreditKeys, true)?'selected':''?>><?=h('$'.fmt_money((float)$co['amount']).' — '.clean_text((string)$co['description'], 120).' — '.(string)$co['expense_account'])?></option><?php endforeach; ?></select><br><button type="submit" name="save_credit_return_items" value="<?=h($ikey)?>" data-anchor="#<?=h(anchor_id('item', (string)$it['vendor'], (string)$it['order_id'], (string)$it['item_key']))?>" style="margin-top:.25rem">Save returned item selection</button><br><span class="small">Select one or more returned original-order lines, then click <strong>Save returned item selection</strong>. The credit memo description/category will be rebuilt from the selection.</span></div><?php endif; endif; ?></td>
           <td><input type="text" name="item[<?=h($ikey)?>][quantity_display]" value="<?=h(fmt_money((float)$it['quantity']))?>" disabled style="max-width:5rem"></td>
           <td><input type="text" name="item[<?=h($ikey)?>][unit_price]" value="<?=h(fmt_money((float)$it['unit_price']))?>"><br><span class="small">line $<?=h(fmt_money(isset($it['source_amount']) && $it['source_amount'] !== null && $it['vendor']==='costco' ? (float)$it['source_amount'] : (float)$it['quantity']*(float)$it['unit_price']))?></span></td>
           <td><input list="accounts" type="text" name="item[<?=h($ikey)?>][expense_account]" value="<?=h($it['expense_account'])?>"></td>
