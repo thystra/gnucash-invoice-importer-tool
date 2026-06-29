@@ -9,7 +9,7 @@
 
 declare(strict_types=1);
 
-const APP_VERSION = '1.0.3';
+const APP_VERSION = '1.0.4';
 const APP_DB = __DIR__ . '/data/review.sqlite';
 const DEFAULT_VENDOR_AMAZON = '000005';
 const DEFAULT_VENDOR_COSTCO = '000001';
@@ -5875,18 +5875,26 @@ function same_invoice_same_product_sample_rows(SQLite3 $db, string $vendor, stri
                            FROM order_items
                            WHERE vendor=:vendor AND order_id=:order_id
                              AND item_key<>:item_key
+                             AND (
+                                  asin=:key
+                               OR item_key=:key
+                               OR item_key LIKE :suffix_key
+                               OR item_key LIKE :middle_key
+                               OR asin LIKE :suffix_key
+                               OR asin LIKE :middle_key
+                             )
                            ORDER BY item_key
-                           LIMIT 200');
+                           LIMIT :limit');
     $stmt->bindValue(':vendor', $vendor, SQLITE3_TEXT);
     $stmt->bindValue(':order_id', $orderId, SQLITE3_TEXT);
     $stmt->bindValue(':item_key', $sourceItemKey, SQLITE3_TEXT);
+    $stmt->bindValue(':key', $ruleKey, SQLITE3_TEXT);
+    $stmt->bindValue(':suffix_key', '%-' . $ruleKey, SQLITE3_TEXT);
+    $stmt->bindValue(':middle_key', '%-' . $ruleKey . '-%', SQLITE3_TEXT);
+    $stmt->bindValue(':limit', max(1, $limit), SQLITE3_INTEGER);
     $res = $stmt->execute();
     $out = [];
-
     while ($r = $res->fetchArray(SQLITE3_ASSOC)) {
-        if (count($out) >= max(1, $limit)) break;
-        $candidateKey = canonical_sku_rule_key_from_values($vendor, (string)($r['asin'] ?? ''), (string)($r['item_key'] ?? ''), (string)($r['description'] ?? ''));
-        if ($candidateKey !== $ruleKey) continue;
         $out[] = [
             'item_key' => (string)($r['item_key'] ?? ''),
             'asin' => (string)($r['asin'] ?? ''),
@@ -5894,10 +5902,9 @@ function same_invoice_same_product_sample_rows(SQLite3 $db, string $vendor, stri
             'expense_account' => (string)($r['expense_account'] ?? ''),
             'locked' => (int)($r['locked'] ?? 0),
             'skip' => (int)($r['skip'] ?? 0),
-            'candidate_rule_key' => $candidateKey,
+            'matched_by' => 'same-invoice direct asin/item_key suffix match',
         ];
     }
-
     return $out;
 }
 
@@ -5909,44 +5916,40 @@ function apply_account_to_same_invoice_same_product(SQLite3 $db, string $vendor,
     $account = trim($account);
     if ($vendor === '' || $orderId === '' || $ruleKey === '' || $account === '' || !str_starts_with($account, 'Expenses:')) return 0;
 
-    $sel = $db->prepare('SELECT item_key, asin, description, expense_account, locked, skip
-                         FROM order_items
-                         WHERE vendor=:vendor AND order_id=:order_id
-                           AND item_key<>:item_key
-                           AND skip=0
-                           AND COALESCE(locked,0)=0
-                           AND item_key<>"AMAZON-RECONCILE"
-                           AND COALESCE(asin,"")<>"AMAZON-RECONCILE"
-                           AND description NOT LIKE "[DISCOUNT:%"
-                           AND description NOT LIKE "[ADJUSTMENT:%"');
-    $sel->bindValue(':vendor', $vendor, SQLITE3_TEXT);
-    $sel->bindValue(':order_id', $orderId, SQLITE3_TEXT);
-    $sel->bindValue(':item_key', $sourceItemKey, SQLITE3_TEXT);
-    $res = $sel->execute();
-
-    $upd = $db->prepare('UPDATE order_items
-                         SET expense_account=:account, match_reason=:reason
-                         WHERE vendor=:vendor AND order_id=:order_id AND item_key=:item_key
-                           AND skip=0 AND COALESCE(locked,0)=0');
-    $changed = 0;
-
-    while ($r = $res->fetchArray(SQLITE3_ASSOC)) {
-        $candidateKey = canonical_sku_rule_key_from_values($vendor, (string)($r['asin'] ?? ''), (string)($r['item_key'] ?? ''), (string)($r['description'] ?? ''));
-        if ($candidateKey === '' || $candidateKey !== $ruleKey) continue;
-
-        $current = trim((string)($r['expense_account'] ?? ''));
-        if ($current === $account) continue;
-
-        $upd->bindValue(':account', $account, SQLITE3_TEXT);
-        $upd->bindValue(':reason', 'same invoice duplicate SKU/item id ' . $ruleKey, SQLITE3_TEXT);
-        $upd->bindValue(':vendor', $vendor, SQLITE3_TEXT);
-        $upd->bindValue(':order_id', $orderId, SQLITE3_TEXT);
-        $upd->bindValue(':item_key', (string)$r['item_key'], SQLITE3_TEXT);
-        $upd->execute();
-        $changed += $db->changes();
-    }
-
-    return $changed;
+    // Same-invoice duplicate SKU propagation must be direct and deterministic.
+    // TSC duplicate receipt lines are distinct item_key values, e.g.
+    // TSC-LINE-0001-2463515 and TSC-LINE-0002-2463515, while the shared product
+    // SKU may be in asin or only in the item_key suffix.
+    $stmt = $db->prepare('UPDATE order_items
+                          SET expense_account=:account, match_reason=:reason
+                          WHERE vendor=:vendor
+                            AND order_id=:order_id
+                            AND item_key<>:source_item_key
+                            AND skip=0
+                            AND COALESCE(locked,0)=0
+                            AND item_key<>\'AMAZON-RECONCILE\'
+                            AND COALESCE(asin,\'\')<>\'AMAZON-RECONCILE\'
+                            AND description NOT LIKE \'[DISCOUNT:%\'
+                            AND description NOT LIKE \'[ADJUSTMENT:%\'
+                            AND COALESCE(expense_account,\'\')<>:account
+                            AND (
+                                 asin=:key
+                              OR item_key=:key
+                              OR item_key LIKE :suffix_key
+                              OR item_key LIKE :middle_key
+                              OR asin LIKE :suffix_key
+                              OR asin LIKE :middle_key
+                            )');
+    $stmt->bindValue(':account', $account, SQLITE3_TEXT);
+    $stmt->bindValue(':reason', 'same invoice duplicate SKU/item id ' . $ruleKey, SQLITE3_TEXT);
+    $stmt->bindValue(':vendor', $vendor, SQLITE3_TEXT);
+    $stmt->bindValue(':order_id', $orderId, SQLITE3_TEXT);
+    $stmt->bindValue(':source_item_key', $sourceItemKey, SQLITE3_TEXT);
+    $stmt->bindValue(':key', $ruleKey, SQLITE3_TEXT);
+    $stmt->bindValue(':suffix_key', '%-' . $ruleKey, SQLITE3_TEXT);
+    $stmt->bindValue(':middle_key', '%-' . $ruleKey . '-%', SQLITE3_TEXT);
+    $stmt->execute();
+    return $db->changes();
 }
 
 function apply_account_to_matching_items(SQLite3 $db, string $vendor, string $keyType, string $key, string $account, bool $overwriteExisting=false): int {
@@ -11447,6 +11450,75 @@ document.addEventListener('click', function(ev) {
       console.log('[GnuCash Vendor Bill Tool] Apply same SKU/item id debug - previous server response after reload', JSON.parse(raw));
     }
   } catch(e) {}
+})();
+</script>
+<script>
+(function(){
+  if (window.__gnucashApplySameSkuSingleSubmitGuard104) return;
+  window.__gnucashApplySameSkuSingleSubmitGuard104 = true;
+
+  function gvbtLog104(label, data) {
+    try { console.log('[GnuCash Vendor Bill Tool] Apply same SKU/item id single-submit 1.0.4 - ' + label, data); }
+    catch (e) {}
+  }
+
+  document.addEventListener('click', function(ev) {
+    const btn = ev.target && ev.target.closest ? ev.target.closest('button[name="recat_item"]') : null;
+    if (!btn) return;
+    const form = btn.form || document.getElementById('reviewForm');
+    if (!form || form.id !== 'reviewForm') return;
+
+    // Take over before older duplicate listeners or the default submit can send
+    // multiple page-wide stale form posts that revert the propagated category.
+    ev.preventDefault();
+    ev.stopImmediatePropagation();
+
+    if (window.__gnucashApplySameSkuInFlight104) {
+      gvbtLog104('ignored duplicate click while request is in flight', {button_value: btn.value});
+      return false;
+    }
+    window.__gnucashApplySameSkuInFlight104 = true;
+
+    const accountField = btn.closest('tr') ? btn.closest('tr').querySelector('input[name$="[expense_account]"]') : null;
+    const payload = new FormData(form);
+    payload.set('action', 'save');
+    payload.set('recat_item', btn.value);
+
+    gvbtLog104('submitting one request', {
+      button_value: btn.value,
+      row_id: btn.closest('tr') ? btn.closest('tr').id : '',
+      account_field_value: accountField ? accountField.value : '',
+      current_url: window.location.href
+    });
+
+    const oldText = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = 'Applying...';
+
+    fetch(form.getAttribute('action') || window.location.href, {
+      method: 'POST',
+      body: payload,
+      headers: {'Accept': 'application/json', 'X-Requested-With': 'fetch'}
+    }).then(async function(resp) {
+      const text = await resp.text();
+      let data = null;
+      try { data = JSON.parse(text); } catch (e) { data = {ok: resp.ok, message: text.slice(0, 500)}; }
+      gvbtLog104('server response', data);
+      try { sessionStorage.setItem('gnucashApplySameSkuLastResponse', JSON.stringify(data)); } catch (e) {}
+      if (!resp.ok || data.ok === false) throw new Error((data && data.message) ? data.message : ('HTTP ' + resp.status));
+      const next = new URL(window.location.href);
+      next.hash = (btn.dataset && btn.dataset.anchor) ? btn.dataset.anchor : (window.location.hash || 'review-top');
+      window.location.assign(next.toString());
+    }).catch(function(err) {
+      window.__gnucashApplySameSkuInFlight104 = false;
+      btn.disabled = false;
+      btn.textContent = oldText;
+      gvbtLog104('request failed', {error: String(err && err.message ? err.message : err)});
+      alert('Apply same SKU/item id failed: ' + (err && err.message ? err.message : err));
+    });
+
+    return false;
+  }, true);
 })();
 </script>
 </body></html>
