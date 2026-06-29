@@ -9,7 +9,7 @@
 
 declare(strict_types=1);
 
-const APP_VERSION = '1.0.6';
+const APP_VERSION = '1.0.7';
 const APP_DB = __DIR__ . '/data/review.sqlite';
 const DEFAULT_VENDOR_AMAZON = '000005';
 const DEFAULT_VENDOR_COSTCO = '000001';
@@ -11193,117 +11193,6 @@ CMD;
 <?php endif; ?>
 <script>
 (function(){
-  if (window.__gnucashApplySameSkuSingleSubmitGuard105) return;
-  window.__gnucashApplySameSkuSingleSubmitGuard105 = true;
-
-  function gvbtAssignNested105(obj, name, value) {
-    const m = String(name || '').match(/^([^\[]+)\[([^\]]+)\]\[([^\]]+)\]$/);
-    if (m) {
-      const root = m[1], key = m[2], field = m[3];
-      if (!obj[root]) obj[root] = {};
-      if (!obj[root][key]) obj[root][key] = {};
-      obj[root][key][field] = value;
-    } else if (name) {
-      obj[name] = value;
-    }
-  }
-
-  function gvbtPayloadFromForm105(form, submitter) {
-    const payload = {};
-    const fd = new FormData(form);
-    for (const [name, value] of fd.entries()) gvbtAssignNested105(payload, name, value);
-    payload.action = 'save';
-    if (submitter && submitter.name) gvbtAssignNested105(payload, submitter.name, submitter.value || '1');
-    return payload;
-  }
-
-  function gvbtReviewReloadUrl105(form, btn) {
-    const url = new URL(window.location.href);
-    ['mode','vendor_hint','vendor_step','page','per_page','filter','search','date_sort','show_skipped'].forEach(function(name) {
-      const el = form.elements[name];
-      if (el && typeof el.value !== 'undefined') url.searchParams.set(name, el.value);
-    });
-    if (!url.searchParams.get('mode')) url.searchParams.set('mode', 'bills');
-    if (!url.searchParams.get('vendor_step')) url.searchParams.set('vendor_step', 'review');
-    const anchor = btn && btn.dataset && btn.dataset.anchor ? btn.dataset.anchor : (window.location.hash || '#review-top');
-    url.hash = anchor.replace(/^#/, '');
-    return url.toString();
-  }
-
-  function gvbtLog105(label, data) {
-    try { console.log('[GnuCash Vendor Bill Tool] Apply same SKU/item id single-submit 1.0.5 - ' + label, data); }
-    catch (e) {}
-  }
-
-  document.addEventListener('click', function(ev) {
-    const btn = ev.target && ev.target.closest ? ev.target.closest('button[name="recat_item"]') : null;
-    if (!btn) return;
-    const form = btn.form || document.getElementById('reviewForm');
-    if (!form || form.id !== 'reviewForm') return;
-
-    ev.preventDefault();
-    ev.stopImmediatePropagation();
-
-    if (window.__gnucashApplySameSkuInFlight105) {
-      gvbtLog105('ignored duplicate click while request is in flight', {button_value: btn.value});
-      return false;
-    }
-    window.__gnucashApplySameSkuInFlight105 = true;
-
-    const row = btn.closest('tr');
-    const accountField = row ? row.querySelector('input[name$="[expense_account]"]') : null;
-    const payload = gvbtPayloadFromForm105(form, btn);
-
-    gvbtLog105('submitting JSON request', {
-      button_value: btn.value,
-      row_id: row ? row.id : '',
-      account_field_value: accountField ? accountField.value : '',
-      payload_recat_item: payload.recat_item || '',
-      payload_action: payload.action,
-      current_url: window.location.href
-    });
-
-    const oldText = btn.textContent;
-    btn.disabled = true;
-    btn.textContent = 'Applying...';
-
-    fetch(window.location.href, {
-      method: 'POST',
-      body: JSON.stringify(payload),
-      headers: {
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-        'X-Requested-With': 'fetch'
-      },
-      credentials: 'same-origin'
-    }).then(async function(resp) {
-      const text = await resp.text();
-      let data = null;
-      try { data = JSON.parse(text); }
-      catch (e) { data = {ok: false, message: 'Expected JSON but received: ' + text.slice(0, 400)}; }
-
-      gvbtLog105('server response', data);
-      try { sessionStorage.setItem('gnucashApplySameSkuLastResponse', JSON.stringify(data)); } catch (e) {}
-
-      if (!resp.ok || data.ok === false) {
-        throw new Error((data && data.message) ? data.message : ('HTTP ' + resp.status));
-      }
-
-      window.location.assign(gvbtReviewReloadUrl105(form, btn));
-    }).catch(function(err) {
-      window.__gnucashApplySameSkuInFlight105 = false;
-      btn.disabled = false;
-      btn.textContent = oldText;
-      gvbtLog105('request failed', {error: String(err && err.message ? err.message : err)});
-      alert('Apply same SKU/item id failed: ' + (err && err.message ? err.message : err));
-    });
-
-    return false;
-  }, true);
-})();
-</script>
-<script>
-(function(){
   const shouldScroll = <?=json_encode(is_export_or_validation_action($lastPostAction) || in_array($lastPostAction, ['build_lowes_payment_plan_reports','run_lowes_payment_matching_dry_run','skip_lowes_payment_targets_and_rerun_dry_run','run_lowes_payment_matching_apply','scan_lowes_unmatched_register_transactions','scan_vendor_unmatched_register_transactions','ignore_vendor_register_transactions','unignore_vendor_register_transaction'], true))?>;
   if (shouldScroll) {
     window.addEventListener('load', function(){
@@ -11441,6 +11330,11 @@ CMD;
   let dirty = false;
   let saving = false;
   function setStatus(t){ status.textContent = t; }
+  window.__gnucashReviewMarkClean = function(message) {
+    dirty = false;
+    saving = false;
+    setStatus(message || 'Saved');
+  };
   function assignNested(obj, name, value){
     const m = name.match(/^([^\[]+)\[([^\]]+)\]\[([^\]]+)\]$/);
     if (m) {
@@ -11464,6 +11358,101 @@ CMD;
     try {
       console.log('[GnuCash Vendor Bill Tool] Apply same SKU/item id debug - ' + stage, detail);
     } catch(e) {}
+  }
+
+  function applySameSkuVisibleUpdates(data, payload) {
+    try {
+      if (!payload || !payload.recat_item || !data || data.ok === false) return;
+
+      const debug = data.debug || {};
+      const parts = String(payload.recat_item || '').split('|');
+      const vendor = debug.vendor || parts[0] || '';
+      const orderId = debug.order_id || parts[1] || '';
+      const clickedItemKey = debug.item_key || parts[2] || '';
+      const account = debug.account || '';
+
+      if (!vendor || !account) return;
+
+      function suffixKey(v) {
+        v = String(v || '').trim();
+        if (!v) return '';
+        const m = v.match(/([A-Za-z0-9]+)$/);
+        return m ? m[1] : v;
+      }
+
+      const ruleKey = String(debug.rule_key || suffixKey(clickedItemKey) || '').trim();
+      const skuKey = suffixKey(ruleKey || clickedItemKey);
+      const rowsToTouch = [];
+
+      function addRow(order, item) {
+        order = String(order || orderId || '').trim();
+        item = String(item || '').trim();
+        if (!order || !item) return;
+        rowsToTouch.push({order_id: order, item_key: item});
+      }
+
+      addRow(orderId, clickedItemKey);
+
+      ['same_invoice_sample_rows_before', 'sample_same_product_rows_before'].forEach(function(field) {
+        const arr = Array.isArray(debug[field]) ? debug[field] : [];
+        arr.forEach(function(r) { addRow(r.order_id || orderId, r.item_key || ''); });
+      });
+
+      function updateRow(row) {
+        if (!row) return false;
+        const accountField = row.querySelector('input[name$="[expense_account]"], select[name$="[expense_account]"], textarea[name$="[expense_account]"]');
+        if (!accountField) return false;
+        if (accountField.disabled || accountField.readOnly) return false;
+
+        accountField.value = account;
+        row.classList.remove('itemrow-uncategorized', 'itemrow-invalid-account');
+        row.classList.add('itemrow-categorized');
+        row.querySelectorAll('td').forEach(function(td) {
+          td.style.backgroundColor = '';
+        });
+        return true;
+      }
+
+      const touched = new Set();
+      let updated = 0;
+
+      rowsToTouch.forEach(function(r) {
+        const id = 'item-' + vendor + '-' + r.order_id + '-' + r.item_key;
+        let row = document.getElementById(id);
+        if (!row && window.CSS && CSS.escape) row = document.querySelector('#' + CSS.escape(id));
+        if (row && !touched.has(row.id)) {
+          touched.add(row.id);
+          if (updateRow(row)) updated++;
+        }
+      });
+
+      // Also update duplicate visible rows for the same SKU text on the current page.
+      if (skuKey) {
+        document.querySelectorAll('tr[id^="item-' + vendor + '-"]').forEach(function(row) {
+          if (touched.has(row.id)) return;
+          const text = row.innerText || '';
+          if (text.includes('SKU / item id ' + skuKey) || text.includes('ASIN ' + skuKey)) {
+            touched.add(row.id);
+            if (updateRow(row)) updated++;
+          }
+        });
+      }
+
+      if (typeof window.__gnucashReviewMarkClean === 'function') {
+        window.__gnucashReviewMarkClean(data.message || 'Saved');
+      }
+
+      logApplySameSku('visible rows updated in place', {
+        updated_visible_rows: updated,
+        rule_key: ruleKey,
+        sku_key: skuKey,
+        account: account,
+        no_reload: true
+      });
+    } catch (e) {
+      logApplySameSku('visible update failed; saved server-side', String(e && e.message ? e.message : e));
+      if (typeof window.__gnucashReviewMarkClean === 'function') window.__gnucashReviewMarkClean('Saved');
+    }
   }
   function buildReviewReloadUrl(anchor=''){
     const url = new URL(window.location.href);
@@ -11494,6 +11483,7 @@ CMD;
         if (payload && payload.recat_item) {
           logApplySameSku('server response', data);
           try { sessionStorage.setItem('gnucashApplySameSkuLastResponse', JSON.stringify(data)); } catch(e) {}
+          applySameSkuVisibleUpdates(data, payload);
         }
         dirty = false;
         setStatus(data.message || 'Saved');
@@ -11560,7 +11550,7 @@ CMD;
         if (node && node.id) anchor = '#' + node.id;
       }
     }
-    const shouldReload = !!(submitter && (submitter.name === 'recat_item' || submitter.name === 'recat_order' || submitter.name === 'recat_recent_manual' || submitter.name === 'save_credit_return_items' || submitter.name === 'set_invoice_category'));
+    const shouldReload = !!(submitter && (submitter.name === 'recat_order' || submitter.name === 'recat_recent_manual' || submitter.name === 'save_credit_return_items' || submitter.name === 'set_invoice_category'));
     savePayload(payload, shouldReload, anchor);
   });
   window.addEventListener('beforeunload', function(ev){
