@@ -9,7 +9,7 @@
 
 declare(strict_types=1);
 
-const APP_VERSION = '1.0.2';
+const APP_VERSION = '1.0.3';
 const APP_DB = __DIR__ . '/data/review.sqlite';
 const DEFAULT_VENDOR_AMAZON = '000005';
 const DEFAULT_VENDOR_COSTCO = '000001';
@@ -5864,6 +5864,91 @@ function extract_costco_target_sku(string $text): string {
     if (preg_match('/for\s+SKU\s+(\d{3,10})/i', $text, $m)) return $m[1];
     return '';
 }
+function same_invoice_same_product_sample_rows(SQLite3 $db, string $vendor, string $orderId, string $sourceItemKey, string $ruleKey, int $limit = 10): array {
+    $vendor = strtolower(trim($vendor));
+    $orderId = trim($orderId);
+    $sourceItemKey = trim($sourceItemKey);
+    $ruleKey = trim($ruleKey);
+    if ($vendor === '' || $orderId === '' || $ruleKey === '') return [];
+
+    $stmt = $db->prepare('SELECT item_key, asin, description, expense_account, locked, skip
+                           FROM order_items
+                           WHERE vendor=:vendor AND order_id=:order_id
+                             AND item_key<>:item_key
+                           ORDER BY item_key
+                           LIMIT 200');
+    $stmt->bindValue(':vendor', $vendor, SQLITE3_TEXT);
+    $stmt->bindValue(':order_id', $orderId, SQLITE3_TEXT);
+    $stmt->bindValue(':item_key', $sourceItemKey, SQLITE3_TEXT);
+    $res = $stmt->execute();
+    $out = [];
+
+    while ($r = $res->fetchArray(SQLITE3_ASSOC)) {
+        if (count($out) >= max(1, $limit)) break;
+        $candidateKey = canonical_sku_rule_key_from_values($vendor, (string)($r['asin'] ?? ''), (string)($r['item_key'] ?? ''), (string)($r['description'] ?? ''));
+        if ($candidateKey !== $ruleKey) continue;
+        $out[] = [
+            'item_key' => (string)($r['item_key'] ?? ''),
+            'asin' => (string)($r['asin'] ?? ''),
+            'description' => (string)($r['description'] ?? ''),
+            'expense_account' => (string)($r['expense_account'] ?? ''),
+            'locked' => (int)($r['locked'] ?? 0),
+            'skip' => (int)($r['skip'] ?? 0),
+            'candidate_rule_key' => $candidateKey,
+        ];
+    }
+
+    return $out;
+}
+
+function apply_account_to_same_invoice_same_product(SQLite3 $db, string $vendor, string $orderId, string $sourceItemKey, string $ruleKey, string $account): int {
+    $vendor = strtolower(trim($vendor));
+    $orderId = trim($orderId);
+    $sourceItemKey = trim($sourceItemKey);
+    $ruleKey = trim($ruleKey);
+    $account = trim($account);
+    if ($vendor === '' || $orderId === '' || $ruleKey === '' || $account === '' || !str_starts_with($account, 'Expenses:')) return 0;
+
+    $sel = $db->prepare('SELECT item_key, asin, description, expense_account, locked, skip
+                         FROM order_items
+                         WHERE vendor=:vendor AND order_id=:order_id
+                           AND item_key<>:item_key
+                           AND skip=0
+                           AND COALESCE(locked,0)=0
+                           AND item_key<>"AMAZON-RECONCILE"
+                           AND COALESCE(asin,"")<>"AMAZON-RECONCILE"
+                           AND description NOT LIKE "[DISCOUNT:%"
+                           AND description NOT LIKE "[ADJUSTMENT:%"');
+    $sel->bindValue(':vendor', $vendor, SQLITE3_TEXT);
+    $sel->bindValue(':order_id', $orderId, SQLITE3_TEXT);
+    $sel->bindValue(':item_key', $sourceItemKey, SQLITE3_TEXT);
+    $res = $sel->execute();
+
+    $upd = $db->prepare('UPDATE order_items
+                         SET expense_account=:account, match_reason=:reason
+                         WHERE vendor=:vendor AND order_id=:order_id AND item_key=:item_key
+                           AND skip=0 AND COALESCE(locked,0)=0');
+    $changed = 0;
+
+    while ($r = $res->fetchArray(SQLITE3_ASSOC)) {
+        $candidateKey = canonical_sku_rule_key_from_values($vendor, (string)($r['asin'] ?? ''), (string)($r['item_key'] ?? ''), (string)($r['description'] ?? ''));
+        if ($candidateKey === '' || $candidateKey !== $ruleKey) continue;
+
+        $current = trim((string)($r['expense_account'] ?? ''));
+        if ($current === $account) continue;
+
+        $upd->bindValue(':account', $account, SQLITE3_TEXT);
+        $upd->bindValue(':reason', 'same invoice duplicate SKU/item id ' . $ruleKey, SQLITE3_TEXT);
+        $upd->bindValue(':vendor', $vendor, SQLITE3_TEXT);
+        $upd->bindValue(':order_id', $orderId, SQLITE3_TEXT);
+        $upd->bindValue(':item_key', (string)$r['item_key'], SQLITE3_TEXT);
+        $upd->execute();
+        $changed += $db->changes();
+    }
+
+    return $changed;
+}
+
 function apply_account_to_matching_items(SQLite3 $db, string $vendor, string $keyType, string $key, string $account, bool $overwriteExisting=false): int {
     $vendor = strtolower(trim($vendor));
     $keyType = strtolower(trim($keyType));
@@ -5998,13 +6083,21 @@ function recategorize_from_item(SQLite3 $db, string $vendor, string $order_id, s
     $eligibleBefore = same_product_candidate_count($db, $vendorNorm, $key, false);
     $pendingBefore = same_product_candidate_count($db, $vendorNorm, $key, true);
     $samplesBefore = same_product_sample_rows($db, $vendorNorm, $key, 12);
+    $sameInvoiceSamplesBefore = same_invoice_same_product_sample_rows($db, $vendorNorm, $order_id, $item_key, $key, 12);
 
     upsert_account_rule($db, $vendorNorm, $type, $key, $acct, 'manual_reference', 110);
+
+    // First force same-invoice duplicate rows. This catches TSC receipts where
+    // the same SKU appears as multiple line-instance keys such as
+    // TSC-LINE-0001-2463515 and TSC-LINE-0002-2463515.
+    $sameInvoiceChanged = apply_account_to_same_invoice_same_product($db, $vendorNorm, $order_id, $item_key, $key, $acct);
+
+    // Then propagate across all staged rows for the same product.
     $exactChanged = apply_account_to_matching_items($db, $vendorNorm, $type, $key, $acct, true);
     $titleChanged = apply_account_to_similar_titles($db, $vendorNorm, (string)$r['description'], $acct, false);
     $couponChanged = apply_costco_coupon_categories($db);
     $discountChanged = apply_amazon_discount_categories($db);
-    $changed = $exactChanged + $titleChanged + $couponChanged + $discountChanged;
+    $changed = $sameInvoiceChanged + $exactChanged + $titleChanged + $couponChanged + $discountChanged;
 
     $debug = [
         'action' => 'recat_item',
@@ -6020,6 +6113,8 @@ function recategorize_from_item(SQLite3 $db, string $vendor, string $order_id, s
         'eligible_same_product_before' => $eligibleBefore,
         'pending_same_product_before' => $pendingBefore,
         'sample_same_product_rows_before' => $samplesBefore,
+        'same_invoice_sample_rows_before' => $sameInvoiceSamplesBefore,
+        'same_invoice_changed' => $sameInvoiceChanged,
         'exact_changed' => $exactChanged,
         'title_changed' => $titleChanged,
         'coupon_changed' => $couponChanged,
@@ -6028,7 +6123,7 @@ function recategorize_from_item(SQLite3 $db, string $vendor, string $order_id, s
     ];
     set_action_debug($debug);
 
-    return [$changed, 'Applied ' . $acct . ' to ' . $changed . ' matching line(s) using ' . product_rule_label_for_vendor($vendorNorm, $type) . ' ' . $key . ($titleChanged ? ' plus matching product title' : '') . '. Eligible same-product rows before apply: ' . $eligibleBefore . '; pending/Uncategorized before apply: ' . $pendingBefore . '. Exact-key changes: ' . $exactChanged . '; title changes: ' . $titleChanged . '. Locked rows were not changed.'];
+    return [$changed, 'Applied ' . $acct . ' to ' . $changed . ' matching line(s) using ' . product_rule_label_for_vendor($vendorNorm, $type) . ' ' . $key . ($titleChanged ? ' plus matching product title' : '') . '. Same-invoice duplicate changes: ' . $sameInvoiceChanged . '; eligible same-product rows before apply: ' . $eligibleBefore . '; pending/Uncategorized before apply: ' . $pendingBefore . '. Exact-key changes: ' . $exactChanged . '; title changes: ' . $titleChanged . '. Locked rows were not changed.'];
 }
 function recategorize_from_order(SQLite3 $db, string $vendor, string $order_id): array {
     $stmt = $db->prepare('SELECT vendor, order_id, item_key, asin, description, notes, expense_account, locked FROM order_items WHERE vendor=:vendor AND order_id=:order_id ORDER BY item_key');
