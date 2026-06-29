@@ -9,7 +9,7 @@
 
 declare(strict_types=1);
 
-const APP_VERSION = 'v207z';
+const APP_VERSION = 'v208a';
 const APP_DB = __DIR__ . '/data/review.sqlite';
 const DEFAULT_VENDOR_AMAZON = '000005';
 const DEFAULT_VENDOR_COSTCO = '000001';
@@ -1170,6 +1170,27 @@ function vendor_requires_posted_bill_export(string $vendor): bool {
 }
 
 
+
+function vendor_uses_sku_product_rules(string $vendor): bool {
+    return in_array(strtolower(trim($vendor)), ['costco','lowes','home_depot','tractor_supply'], true);
+}
+
+function product_rule_label_for_vendor(string $vendor, string $keyType): string {
+    $vendor = strtolower(trim($vendor));
+    $keyType = strtolower(trim($keyType));
+    if (vendor_uses_sku_product_rules($vendor)) {
+        return vendor_config($vendor)['product_key_label'] ?? 'SKU / item id';
+    }
+    if ($vendor === 'walmart') return 'product title';
+    return strtoupper($keyType);
+}
+
+function product_rule_key_from_item_key(string $itemKey): string {
+    $itemKey = trim($itemKey);
+    if ($itemKey === '') return '';
+    if (preg_match('/([A-Za-z0-9]{3,})$/', $itemKey, $m)) return (string)$m[1];
+    return '';
+}
 
 function normalize_key_text(string $s): string {
     $s = strtolower(trim($s));
@@ -5738,8 +5759,11 @@ function apply_account_to_matching_items(SQLite3 $db, string $vendor, string $ke
     $key = trim($key);
     $account = trim($account);
     if ($vendor === '' || $key === '' || $account === '' || !str_starts_with($account, 'Expenses:')) return 0;
-    $reason = ($overwriteExisting ? 'manually propagated from reviewed ' : 'auto-applied from reviewed ') . ($vendor === 'costco' ? 'SKU' : strtoupper($keyType)) . ' ' . $key;
+
+    $label = product_rule_label_for_vendor($vendor, $keyType);
+    $reason = ($overwriteExisting ? 'manually propagated from reviewed ' : 'auto-applied from reviewed ') . $label . ' ' . $key;
     $pendingClause = $overwriteExisting ? '' : ' AND (expense_account IS NULL OR trim(expense_account)="" OR expense_account LIKE "%Uncategorized%")';
+
     if ($vendor === 'costco') {
         // Apply the account to same-SKU rows and coupon rows that reference this SKU.
         // Explicit "Apply same SKU" is intentional: update every unlocked matching row, not only Uncategorized.
@@ -5748,9 +5772,27 @@ function apply_account_to_matching_items(SQLite3 $db, string $vendor, string $ke
             WHERE vendor=:vendor AND skip=0 AND COALESCE(locked,0)=0
               AND item_key<>'AMAZON-RECONCILE' AND asin<>'AMAZON-RECONCILE'
               AND description NOT LIKE '[DISCOUNT:%' AND description NOT LIKE '[ADJUSTMENT:%'
-              AND (asin=:key OR notes LIKE :target_note OR description LIKE :target_desc)" . $pendingClause);
+              AND (asin=:key OR item_key=:key OR notes LIKE :target_note OR description LIKE :target_desc)" . $pendingClause);
         $stmt->bindValue(':target_note', '%Target SKU: '.$key.'%', SQLITE3_TEXT);
         $stmt->bindValue(':target_desc', '%for SKU '.$key.'%', SQLITE3_TEXT);
+    } elseif (vendor_uses_sku_product_rules($vendor)) {
+        // Lowe's, Home Depot, and Tractor Supply store the real product identifier in asin,
+        // but some importers make item_key line-specific (for example TSC-LINE-0002-1591774).
+        // Match both exact asin/SKU and safe item_key suffix forms so "Apply same SKU/item id"
+        // propagates across all pending staged invoices for the same product.
+        $stmt = $db->prepare("UPDATE order_items
+            SET expense_account=:account, match_reason=:reason
+            WHERE vendor=:vendor AND skip=0 AND COALESCE(locked,0)=0
+              AND item_key<>'AMAZON-RECONCILE' AND COALESCE(asin,'')<>'AMAZON-RECONCILE'
+              AND description NOT LIKE '[DISCOUNT:%' AND description NOT LIKE '[ADJUSTMENT:%'
+              AND (
+                    asin=:key
+                 OR item_key=:key
+                 OR item_key LIKE :item_key_suffix
+                 OR item_key LIKE :item_key_middle
+              )" . $pendingClause);
+        $stmt->bindValue(':item_key_suffix', '%-'.$key, SQLITE3_TEXT);
+        $stmt->bindValue(':item_key_middle', '%-'.$key.'-%', SQLITE3_TEXT);
     } else {
         $stmt = $db->prepare("UPDATE order_items
             SET expense_account=:account, match_reason=:reason
@@ -5759,6 +5801,7 @@ function apply_account_to_matching_items(SQLite3 $db, string $vendor, string $ke
               AND description NOT LIKE '[DISCOUNT:%' AND description NOT LIKE '[ADJUSTMENT:%'
               AND asin=:key" . $pendingClause);
     }
+
     $stmt->bindValue(':account', $account, SQLITE3_TEXT);
     $stmt->bindValue(':reason', $reason, SQLITE3_TEXT);
     $stmt->bindValue(':vendor', $vendor, SQLITE3_TEXT);
@@ -5837,6 +5880,11 @@ function item_reference_key_for_rule(array $r): array {
         $sku = $target !== '' ? $target : trim((string)($r['asin'] ?? ''));
         return ['sku', $sku];
     }
+    if (vendor_uses_sku_product_rules($vendor)) {
+        $sku = trim((string)($r['asin'] ?? ''));
+        if ($sku === '') $sku = product_rule_key_from_item_key((string)($r['item_key'] ?? ''));
+        return ['sku', $sku];
+    }
     if ($vendor === 'walmart') {
         $key = trim((string)($r['asin'] ?? ''));
         if ($key === '') $key = normalize_key_text((string)($r['description'] ?? ''));
@@ -5862,7 +5910,7 @@ function recategorize_from_item(SQLite3 $db, string $vendor, string $order_id, s
     $changed += $titleChanged;
     $changed += apply_costco_coupon_categories($db);
     $changed += apply_amazon_discount_categories($db);
-    return [$changed, 'Applied ' . $acct . ' to ' . $changed . ' matching line(s) using ' . strtoupper($type) . ' ' . $key . ($titleChanged ? ' plus matching product title' : '') . '. Explicit SKU/ASIN propagation updates all unlocked exact-key rows; title propagation updates pending/Uncategorized rows. Locked rows were not changed.'];
+    return [$changed, 'Applied ' . $acct . ' to ' . $changed . ' matching line(s) using ' . product_rule_label_for_vendor($vendor, $type) . ' ' . $key . ($titleChanged ? ' plus matching product title' : '') . '. Explicit same-product propagation updates all unlocked exact-key rows; title propagation updates pending/Uncategorized rows. Locked rows were not changed.'];
 }
 function recategorize_from_order(SQLite3 $db, string $vendor, string $order_id): array {
     $stmt = $db->prepare('SELECT vendor, order_id, item_key, asin, description, notes, expense_account, locked FROM order_items WHERE vendor=:vendor AND order_id=:order_id ORDER BY item_key');
@@ -8102,10 +8150,10 @@ function save_review_edits(SQLite3 $db, array $post): void {
             $db->exec('BEGIN IMMEDIATE');
             foreach ($post['order'] ?? [] as $key => $data) {
                     [$vendor, $order_id] = explode('|', $key, 2);
-                    $stmt = $db->prepare('UPDATE orders SET expense_account=:expense, item_amount=:item_amount, tax_account=:tax_account, shipping_account=:shipping_account, skip=:skip, locked=:locked=:notes=:notes WHERE vendor=:vendor AND order_id=:order_id');
+                    $stmt = $db->prepare('UPDATE orders SET expense_account=:expense, item_amount=:item_amount, tax_account=:tax_account, shipping_account=:shipping_account, skip=:skip, locked=:locked, notes=:notes WHERE vendor=:vendor AND order_id=:order_id');
                     $stmt->bindValue(':expense', $data['expense_account'] ?? '', SQLITE3_TEXT); $stmt->bindValue(':item_amount', money_to_float($data['item_amount'] ?? '0'), SQLITE3_FLOAT);
                     $stmt->bindValue(':tax_account', $data['tax_account'] ?? default_config_value('DEFAULT_TAX_ACCOUNT'), SQLITE3_TEXT); $stmt->bindValue(':shipping_account', $data['shipping_account'] ?? default_config_value('DEFAULT_SHIPPING_ACCOUNT'), SQLITE3_TEXT);
-                    $stmt->bindValue(':skip', isset($data['skip']) ? 1 : 0, SQLITE3_INTEGER); $stmt->bindValue(':locked', isset($data['locked']) ? 1 : 0, SQLITE3_INTEGER);                    $stmt->bindValue(':vendor', $vendor, SQLITE3_TEXT); $stmt->bindValue(':order_id', $order_id, SQLITE3_TEXT); $stmt->execute();
+                    $stmt->bindValue(':skip', isset($data['skip']) ? 1 : 0, SQLITE3_INTEGER); $stmt->bindValue(':locked', isset($data['locked']) ? 1 : 0, SQLITE3_INTEGER); $stmt->bindValue(':notes', $data['notes'] ?? '', SQLITE3_TEXT);                    $stmt->bindValue(':vendor', $vendor, SQLITE3_TEXT); $stmt->bindValue(':order_id', $order_id, SQLITE3_TEXT); $stmt->execute();
                 }
                 foreach ($post['item'] ?? [] as $key => $data) {
                     [$vendor, $order_id, $item_key] = explode('|', $key, 3);
@@ -8124,7 +8172,7 @@ function save_review_edits(SQLite3 $db, array $post): void {
                         $lookup->bindValue(':vendor', $vendor, SQLITE3_TEXT); $lookup->bindValue(':order_id', $order_id, SQLITE3_TEXT); $lookup->bindValue(':item_key', $item_key, SQLITE3_TEXT);
                         $lr = $lookup->execute()->fetchArray(SQLITE3_ASSOC);
                         if ($lr && !is_reconcile_or_discount_item(['vendor'=>$vendor,'order_id'=>$order_id,'item_key'=>$item_key,'asin'=>$lr['asin'] ?? '', 'description'=>$lr['description'] ?? ''])) {
-                            $type = $vendor === 'costco' ? 'sku' : ($vendor === 'walmart' ? 'title' : 'asin');
+                            $type = vendor_uses_sku_product_rules($vendor) ? 'sku' : ($vendor === 'walmart' ? 'title' : 'asin');
                             $primaryKey = trim((string)$lr['asin']);
                             $targetSku = $vendor === 'costco' ? extract_costco_target_sku((string)$lr['notes'] . ' ' . (string)$lr['description']) : '';
                             if ($targetSku !== '') $primaryKey = $targetSku;
