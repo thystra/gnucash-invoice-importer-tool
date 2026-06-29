@@ -9,7 +9,7 @@
 
 declare(strict_types=1);
 
-const APP_VERSION = 'v208a';
+const APP_VERSION = '1.0.0';
 const APP_DB = __DIR__ . '/data/review.sqlite';
 const DEFAULT_VENDOR_AMAZON = '000005';
 const DEFAULT_VENDOR_COSTCO = '000001';
@@ -1171,6 +1171,9 @@ function vendor_requires_posted_bill_export(string $vendor): bool {
 
 
 
+
+
+
 function vendor_uses_sku_product_rules(string $vendor): bool {
     return in_array(strtolower(trim($vendor)), ['costco','lowes','home_depot','tractor_supply'], true);
 }
@@ -1190,6 +1193,50 @@ function product_rule_key_from_item_key(string $itemKey): string {
     if ($itemKey === '') return '';
     if (preg_match('/([A-Za-z0-9]{3,})$/', $itemKey, $m)) return (string)$m[1];
     return '';
+}
+
+function product_rule_where_sql(string $vendor, string $pendingClause = ''): string {
+    $vendor = strtolower(trim($vendor));
+    $base = "vendor=:vendor AND skip=0 AND COALESCE(locked,0)=0
+              AND item_key<>'AMAZON-RECONCILE' AND COALESCE(asin,'')<>'AMAZON-RECONCILE'
+              AND description NOT LIKE '[DISCOUNT:%' AND description NOT LIKE '[ADJUSTMENT:%'";
+    if ($vendor === 'costco') {
+        return $base . " AND (asin=:key OR item_key=:key OR notes LIKE :target_note OR description LIKE :target_desc)" . $pendingClause;
+    }
+    if (vendor_uses_sku_product_rules($vendor)) {
+        return $base . " AND (asin=:key OR item_key=:key OR item_key LIKE :item_key_suffix OR item_key LIKE :item_key_middle)" . $pendingClause;
+    }
+    return $base . " AND asin=:key" . $pendingClause;
+}
+
+function bind_product_rule_params(SQLite3Stmt $stmt, string $vendor, string $key): void {
+    $vendor = strtolower(trim($vendor));
+    $stmt->bindValue(':vendor', $vendor, SQLITE3_TEXT);
+    $stmt->bindValue(':key', $key, SQLITE3_TEXT);
+    if ($vendor === 'costco') {
+        $stmt->bindValue(':target_note', '%Target SKU: ' . $key . '%', SQLITE3_TEXT);
+        $stmt->bindValue(':target_desc', '%for SKU ' . $key . '%', SQLITE3_TEXT);
+    }
+    if (vendor_uses_sku_product_rules($vendor) && $vendor !== 'costco') {
+        $stmt->bindValue(':item_key_suffix', '%-' . $key, SQLITE3_TEXT);
+        $stmt->bindValue(':item_key_middle', '%-' . $key . '-%', SQLITE3_TEXT);
+    }
+}
+
+function same_product_candidate_count(SQLite3 $db, string $vendor, string $key, bool $pendingOnly): int {
+    $vendor = strtolower(trim($vendor));
+    $key = trim($key);
+    if ($vendor === '' || $key === '') return 0;
+    $pendingClause = $pendingOnly ? ' AND (expense_account IS NULL OR trim(expense_account)="" OR expense_account LIKE "%Uncategorized%")' : '';
+    $sql = 'SELECT COUNT(*) AS c FROM order_items WHERE ' . product_rule_where_sql($vendor, $pendingClause);
+    $stmt = $db->prepare($sql);
+    bind_product_rule_params($stmt, $vendor, $key);
+    $row = $stmt->execute()->fetchArray(SQLITE3_ASSOC);
+    return (int)($row['c'] ?? 0);
+}
+
+function set_action_debug(array $debug): void {
+    $GLOBALS['last_action_debug'] = $debug;
 }
 
 function normalize_key_text(string $s): string {
@@ -5763,49 +5810,11 @@ function apply_account_to_matching_items(SQLite3 $db, string $vendor, string $ke
     $label = product_rule_label_for_vendor($vendor, $keyType);
     $reason = ($overwriteExisting ? 'manually propagated from reviewed ' : 'auto-applied from reviewed ') . $label . ' ' . $key;
     $pendingClause = $overwriteExisting ? '' : ' AND (expense_account IS NULL OR trim(expense_account)="" OR expense_account LIKE "%Uncategorized%")';
-
-    if ($vendor === 'costco') {
-        // Apply the account to same-SKU rows and coupon rows that reference this SKU.
-        // Explicit "Apply same SKU" is intentional: update every unlocked matching row, not only Uncategorized.
-        $stmt = $db->prepare("UPDATE order_items
-            SET expense_account=:account, match_reason=:reason
-            WHERE vendor=:vendor AND skip=0 AND COALESCE(locked,0)=0
-              AND item_key<>'AMAZON-RECONCILE' AND asin<>'AMAZON-RECONCILE'
-              AND description NOT LIKE '[DISCOUNT:%' AND description NOT LIKE '[ADJUSTMENT:%'
-              AND (asin=:key OR item_key=:key OR notes LIKE :target_note OR description LIKE :target_desc)" . $pendingClause);
-        $stmt->bindValue(':target_note', '%Target SKU: '.$key.'%', SQLITE3_TEXT);
-        $stmt->bindValue(':target_desc', '%for SKU '.$key.'%', SQLITE3_TEXT);
-    } elseif (vendor_uses_sku_product_rules($vendor)) {
-        // Lowe's, Home Depot, and Tractor Supply store the real product identifier in asin,
-        // but some importers make item_key line-specific (for example TSC-LINE-0002-1591774).
-        // Match both exact asin/SKU and safe item_key suffix forms so "Apply same SKU/item id"
-        // propagates across all pending staged invoices for the same product.
-        $stmt = $db->prepare("UPDATE order_items
-            SET expense_account=:account, match_reason=:reason
-            WHERE vendor=:vendor AND skip=0 AND COALESCE(locked,0)=0
-              AND item_key<>'AMAZON-RECONCILE' AND COALESCE(asin,'')<>'AMAZON-RECONCILE'
-              AND description NOT LIKE '[DISCOUNT:%' AND description NOT LIKE '[ADJUSTMENT:%'
-              AND (
-                    asin=:key
-                 OR item_key=:key
-                 OR item_key LIKE :item_key_suffix
-                 OR item_key LIKE :item_key_middle
-              )" . $pendingClause);
-        $stmt->bindValue(':item_key_suffix', '%-'.$key, SQLITE3_TEXT);
-        $stmt->bindValue(':item_key_middle', '%-'.$key.'-%', SQLITE3_TEXT);
-    } else {
-        $stmt = $db->prepare("UPDATE order_items
-            SET expense_account=:account, match_reason=:reason
-            WHERE vendor=:vendor AND skip=0 AND COALESCE(locked,0)=0
-              AND item_key<>'AMAZON-RECONCILE' AND asin<>'AMAZON-RECONCILE'
-              AND description NOT LIKE '[DISCOUNT:%' AND description NOT LIKE '[ADJUSTMENT:%'
-              AND asin=:key" . $pendingClause);
-    }
-
+    $sql = 'UPDATE order_items SET expense_account=:account, match_reason=:reason WHERE ' . product_rule_where_sql($vendor, $pendingClause);
+    $stmt = $db->prepare($sql);
     $stmt->bindValue(':account', $account, SQLITE3_TEXT);
     $stmt->bindValue(':reason', $reason, SQLITE3_TEXT);
-    $stmt->bindValue(':vendor', $vendor, SQLITE3_TEXT);
-    $stmt->bindValue(':key', $key, SQLITE3_TEXT);
+    bind_product_rule_params($stmt, $vendor, $key);
     $stmt->execute();
     return $db->changes();
 }
@@ -5898,19 +5907,56 @@ function recategorize_from_item(SQLite3 $db, string $vendor, string $order_id, s
     $stmt->bindValue(':order_id', $order_id, SQLITE3_TEXT);
     $stmt->bindValue(':item_key', $item_key, SQLITE3_TEXT);
     $r = $stmt->execute()->fetchArray(SQLITE3_ASSOC);
-    if (!$r) return [0, 'Item not found for recategorization.'];
-    if (is_reconcile_or_discount_item($r)) return [0, 'Discount/reconciliation rows do not create global product rules. They inherit a same-invoice item category instead.'];
+    if (!$r) {
+        set_action_debug(['action'=>'recat_item','vendor'=>$vendor,'order_id'=>$order_id,'item_key'=>$item_key,'found'=>false]);
+        return [0, 'Item not found for recategorization.'];
+    }
+    if (is_reconcile_or_discount_item($r)) {
+        set_action_debug(['action'=>'recat_item','vendor'=>$vendor,'order_id'=>$order_id,'item_key'=>$item_key,'found'=>true,'blocked'=>'discount_or_reconciliation']);
+        return [0, 'Discount/reconciliation rows do not create global product rules. They inherit a same-invoice item category instead.'];
+    }
     $acct = trim((string)($r['expense_account'] ?? ''));
-    if ($acct === '' || !str_starts_with($acct, 'Expenses:') || is_placeholder_account($acct)) return [0, 'Reference item does not have a usable Expenses account yet.'];
+    if ($acct === '' || !str_starts_with($acct, 'Expenses:') || is_placeholder_account($acct)) {
+        set_action_debug(['action'=>'recat_item','vendor'=>$vendor,'order_id'=>$order_id,'item_key'=>$item_key,'found'=>true,'account'=>$acct,'blocked'=>'no_usable_expense_account']);
+        return [0, 'Reference item does not have a usable Expenses account yet.'];
+    }
     [$type, $key] = item_reference_key_for_rule($r);
-    if ($key === '') return [0, 'Reference item does not have a usable ASIN/SKU key.'];
-    upsert_account_rule($db, strtolower($vendor), $type, $key, $acct, 'manual_reference', 110);
-    $changed = apply_account_to_matching_items($db, strtolower($vendor), $type, $key, $acct, true);
-    $titleChanged = apply_account_to_similar_titles($db, strtolower($vendor), (string)$r['description'], $acct, false);
+    if ($key === '') {
+        set_action_debug(['action'=>'recat_item','vendor'=>$vendor,'order_id'=>$order_id,'item_key'=>$item_key,'found'=>true,'account'=>$acct,'blocked'=>'no_product_key']);
+        return [0, 'Reference item does not have a usable ASIN/SKU key.'];
+    }
+
+    $vendorNorm = strtolower($vendor);
+    $eligibleBefore = same_product_candidate_count($db, $vendorNorm, $key, false);
+    $pendingBefore = same_product_candidate_count($db, $vendorNorm, $key, true);
+
+    upsert_account_rule($db, $vendorNorm, $type, $key, $acct, 'manual_reference', 110);
+    $changed = apply_account_to_matching_items($db, $vendorNorm, $type, $key, $acct, true);
+    $titleChanged = apply_account_to_similar_titles($db, $vendorNorm, (string)$r['description'], $acct, false);
     $changed += $titleChanged;
     $changed += apply_costco_coupon_categories($db);
     $changed += apply_amazon_discount_categories($db);
-    return [$changed, 'Applied ' . $acct . ' to ' . $changed . ' matching line(s) using ' . product_rule_label_for_vendor($vendor, $type) . ' ' . $key . ($titleChanged ? ' plus matching product title' : '') . '. Explicit same-product propagation updates all unlocked exact-key rows; title propagation updates pending/Uncategorized rows. Locked rows were not changed.'];
+
+    $debug = [
+        'action' => 'recat_item',
+        'vendor' => $vendorNorm,
+        'order_id' => $order_id,
+        'item_key' => $item_key,
+        'source_asin_or_sku' => (string)($r['asin'] ?? ''),
+        'description' => (string)($r['description'] ?? ''),
+        'account' => $acct,
+        'rule_type' => $type,
+        'rule_key' => $key,
+        'rule_label' => product_rule_label_for_vendor($vendorNorm, $type),
+        'eligible_same_product_before' => $eligibleBefore,
+        'pending_same_product_before' => $pendingBefore,
+        'exact_changed' => $changed - $titleChanged,
+        'title_changed' => $titleChanged,
+        'total_changed' => $changed,
+    ];
+    set_action_debug($debug);
+
+    return [$changed, 'Applied ' . $acct . ' to ' . $changed . ' matching line(s) using ' . product_rule_label_for_vendor($vendorNorm, $type) . ' ' . $key . ($titleChanged ? ' plus matching product title' : '') . '. Eligible same-product rows before apply: ' . $eligibleBefore . '; pending/Uncategorized before apply: ' . $pendingBefore . '. Explicit same-product propagation updates all unlocked exact-key rows; title propagation updates pending/Uncategorized rows. Locked rows were not changed.'];
 }
 function recategorize_from_order(SQLite3 $db, string $vendor, string $order_id): array {
     $stmt = $db->prepare('SELECT vendor, order_id, item_key, asin, description, notes, expense_account, locked FROM order_items WHERE vendor=:vendor AND order_id=:order_id ORDER BY item_key');
@@ -9742,7 +9788,7 @@ if (($request['action'] ?? '') === 'export_vendor_ledger_diff_report') {
             } else {
                 $message = 'Review edits saved.';
             }
-            if ($isJsonPost) respond_json(['ok'=>true, 'message'=>$message]);
+            if ($isJsonPost) respond_json(['ok'=>true, 'message'=>$message, 'debug'=>$GLOBALS['last_action_debug'] ?? null]);
         } catch (Throwable $e) {
             if ($isJsonPost) respond_json(['ok'=>false, 'message'=>'Save failed: ' . $e->getMessage()]);
             throw $e;
@@ -11070,6 +11116,11 @@ CMD;
     if (ajaxAction) payload.action = ajaxAction;
     return payload;
   }
+  function logApplySameSku(stage, detail){
+    try {
+      console.log('[GnuCash Vendor Bill Tool] Apply same SKU/item id debug - ' + stage, detail);
+    } catch(e) {}
+  }
   function buildReviewReloadUrl(anchor=''){
     const url = new URL(window.location.href);
     const copyFields = ['mode','vendor_hint','vendor_step','page','per_page','filter','search','date_sort','show_skipped'];
@@ -11096,6 +11147,7 @@ CMD;
       });
       const data = await res.json();
       if (data.ok) {
+        if (payload && payload.recat_item) logApplySameSku('server response', data);
         dirty = false;
         setStatus(data.message || 'Saved');
         if (reloadAfter) {
@@ -11103,10 +11155,12 @@ CMD;
           return;
         }
       } else {
+        if (payload && payload.recat_item) logApplySameSku('server error response', data);
         setStatus(data.message || 'Save failed');
         alert(data.message || 'Save failed');
       }
     } catch(e) {
+      if (payload && payload.recat_item) logApplySameSku('fetch exception', e);
       setStatus('Save failed: ' + e);
       alert('Save failed: ' + e);
     }
@@ -11125,6 +11179,19 @@ CMD;
     ev.preventDefault();
     const submitter = ev.submitter || document.activeElement;
     const payload = formToPayload(submitter, 'save');
+    const isApplySameSku = !!(submitter && submitter.name === 'recat_item');
+    if (isApplySameSku) {
+      const row = submitter.closest('tr[id]');
+      const acctInput = row ? row.querySelector('input[name$=\"[expense_account]\"]') : null;
+      logApplySameSku('click', {
+        button_value: submitter.value || '',
+        row_id: row ? row.id : '',
+        account_field_value: acctInput ? acctInput.value : '',
+        payload_recat_item: payload.recat_item || '',
+        payload_action: payload.action || '',
+        current_url: window.location.href
+      });
+    }
     let anchor = '';
     if (submitter) {
       anchor = submitter.dataset && submitter.dataset.anchor ? submitter.dataset.anchor : '';
