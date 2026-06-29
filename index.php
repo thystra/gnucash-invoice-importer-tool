@@ -9,7 +9,7 @@
 
 declare(strict_types=1);
 
-const APP_VERSION = '1.0.1';
+const APP_VERSION = '1.0.2';
 const APP_DB = __DIR__ . '/data/review.sqlite';
 const DEFAULT_VENDOR_AMAZON = '000005';
 const DEFAULT_VENDOR_COSTCO = '000001';
@@ -11252,9 +11252,9 @@ CMD;
   if (btn) btn.addEventListener('click', function(){ dirty = true; saveNow(); });
   form.addEventListener('submit', function(ev){
     ev.preventDefault();
-    const submitter = ev.submitter || document.activeElement;
-    const payload = formToPayload(submitter, 'save');
-    const isApplySameSku = !!(submitter && submitter.name === 'recat_item');
+    var submitter = ev.submitter || document.activeElement;
+    var payload = formToPayload(submitter, 'save');
+    var isApplySameSku = !!(submitter && submitter.name === 'recat_item');
     if (isApplySameSku) {
       const row = submitter.closest('tr[id]');
       const acctInput = row ? row.querySelector('input[name$="[expense_account]"]') : null;
@@ -11267,7 +11267,7 @@ CMD;
         current_url: window.location.href
       });
     }
-    const isApplySameSku = !!(submitter && submitter.name === 'recat_item');
+    var isApplySameSku = !!(submitter && submitter.name === 'recat_item');
     if (isApplySameSku) {
       const row = submitter.closest('tr[id]');
       const acctInput = row ? row.querySelector('input[name$=\"[expense_account]\"]') : null;
