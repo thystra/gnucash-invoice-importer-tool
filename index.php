@@ -9,7 +9,7 @@
 
 declare(strict_types=1);
 
-const APP_VERSION = '1.0.5';
+const APP_VERSION = '1.0.6';
 const APP_DB = __DIR__ . '/data/review.sqlite';
 const DEFAULT_VENDOR_AMAZON = '000005';
 const DEFAULT_VENDOR_COSTCO = '000001';
@@ -5868,27 +5868,38 @@ function extract_costco_target_sku(string $text): string {
 
 function same_product_key_variants_for_match(string $ruleKey, string $sourceItemKey = '', string $sourceAsin = ''): array {
     $raw = [$ruleKey, $sourceItemKey, $sourceAsin];
+    $seen = [];
     $out = [];
+
+    $add = function ($candidate) use (&$seen, &$out): void {
+        $candidate = trim((string)$candidate);
+        if ($candidate === '') return;
+        if (strlen($candidate) < 3) return;
+
+        // Do not use the raw candidate as the PHP array key. Numeric SKU strings
+        // become integer array keys in PHP, which caused strlen(int) failures.
+        $dedupeKey = 'k:' . strtolower($candidate);
+        if (isset($seen[$dedupeKey])) return;
+
+        $seen[$dedupeKey] = true;
+        $out[] = $candidate;
+    };
 
     foreach ($raw as $v) {
         $v = trim((string)$v);
         if ($v === '') continue;
-        $out[$v] = $v;
+
+        $add($v);
 
         $suffix = product_rule_key_from_item_key($v);
-        if ($suffix !== '') $out[$suffix] = $suffix;
+        $add($suffix);
 
         if (preg_match('/(?:SKU|item id)\s+([A-Za-z0-9]{3,})/i', $v, $m)) {
-            $out[(string)$m[1]] = (string)$m[1];
+            $add((string)$m[1]);
         }
     }
 
-    // Avoid weak very-short keys; normal TSC/Costco/Lowe's SKUs are longer.
-    foreach (array_keys($out) as $k) {
-        if (strlen($k) < 3) unset($out[$k]);
-    }
-
-    return array_values($out);
+    return $out;
 }
 
 function same_invoice_same_product_sample_rows(SQLite3 $db, string $vendor, string $orderId, string $sourceItemKey, string $ruleKey, int $limit = 10): array {
